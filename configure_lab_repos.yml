@@ -1,0 +1,80 @@
+---
+- name: Configure RHEL 9 Internal Repositories
+  hosts: all
+  become: yes
+  vars:
+    # Genel Repo Ayarları
+    repo_name_base: "lab"
+    gpg_check_enabled: false  # İç ağlar için genelde false yapılır, keys yoksa hata alır. True yaparsanız key import etmelisiniz.
+    ssl_verify: true          # HTTPS kullanıyorsanız true bırakın, self-signed cert varsa false yapın.
+    
+    # Repo Listesi (İsim ve URL Eşleşmeleri)
+    repos:
+      - name: "lab-baseos"
+        desc: "RHEL 9 BaseOS Internal Repository"
+        url: "https://repo.lab.akyuz.tech/rhel9/rhel-9-for-x86_64-baseos-rpms/"
+      
+      - name: "lab-appstream"
+        desc: "RHEL 9 AppStream Internal Repository"
+        url: "https://repo.lab.akyuz.tech/rhel9/rhel-9-for-x86_64-appstream-rpms/"
+
+      - name: "lab-extensions"
+        desc: "RHEL 9 Extensions Internal Repository"
+        url: "https://repo.lab.akyuz.tech/rhel9/rhel-9-for-x86_64-extensions-rpms/"
+
+      - name: "lab-ha"
+        desc: "RHEL 9 High Availability Internal Repository"
+        url: "https://repo.lab.akyuz.tech/rhel9/rhel-9-for-x86_64-highavailability-rpms/"
+
+      - name: "lab-resilientstorage"
+        desc: "RHEL 9 Resilient Storage Internal Repository"
+        url: "https://repo.lab.akyuz.tech/rhel9/rhel-9-for-x86_64-resilientstorage-rpms/"
+
+      - name: "lab-codeready"
+        desc: "RHEL 9 CodeReady Builder (Development)"
+        url: "https://repo.lab.akyuz.tech/rhel9/codeready-builder-for-rhel-9-x86_64-rpms/"
+
+      # Debug repolarını varsayılan olarak devre dışı bırakıyoruz, gerekirse manuel açılabilir
+      - name: "lab-baseos-debug"
+        desc: "RHEL 9 BaseOS Debug Repository"
+        url: "https://repo.lab.akyuz.tech/rhel9/rhel-9-for-x86_64-baseos-debug-rpms/"
+        enabled: false
+
+      - name: "lab-appstream-debug"
+        desc: "RHEL 9 AppStream Debug Repository"
+        url: "https://repo.lab.akyuz.tech/rhel9/rhel-9-for-x86_64-appstream-debug-rpms/"
+        enabled: false
+
+  tasks:
+    - name: Create .repo file for Lab Repositories
+      copy:
+        dest: "/etc/yum.repos.d/{{ repo_name_base }}.repo"
+        mode: '0644'
+        content: |
+          {% for repo in repos %}
+          [{{ repo.name }}]
+          name={{ repo.desc }}
+          baseurl={{ repo.url }}
+          gpgcheck={{ gpg_check_enabled | lower }}
+          ssl_verify={{ ssl_verify | lower }}
+          enabled={{ 'yes' if repo.enabled is undefined else 'yes' if repo.enabled else 'no' }}
+          priority=10
+          
+          {% endfor %}
+
+    - name: Clean DNF Metadata Cache
+      command: dnf clean all
+      changed_when: false
+
+    - name: Update DNF Metadata
+      command: dnf makecache
+      changed_when: false
+
+    - name: Verify Repository Configuration
+      shell: "dnf repolist --all | grep -E '{{ repo_name_base }}' || echo 'Repos are not visible'"
+      register: repo_check
+      changed_when: false
+      
+    - debug:
+        msg: "{{ repo_check.stdout_lines }}"
+

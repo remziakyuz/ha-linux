@@ -1,0 +1,110 @@
+---
+# =============================================================================
+# T12 — FAILOVER DÖNGÜSÜ TASK DOSYASI
+# =============================================================================
+# T12 play'i tarafından include_tasks ile çağrılır.
+# Her döngüde (cycle_num) bir VIP failover gerçekleştirilir ve
+# veri tutarlılığı doğrulanır.
+#
+# Değişkenler (T12 play'inden miras alınır):
+#   cycle_num   : Mevcut döngü numarası (1, 2, 3 ...)
+#   cycle_wait  : Failover sonrası bekleme süresi (saniye)
+#   virtual_ip  : Cluster VIP adresi
+#   pgsql_password : PostgreSQL postgres kullanıcısı parolası (inventory'den)
+# =============================================================================
+
+# ---- Döngü başlangıç durumu ------------------------------------------------
+- name: "T12 | Döngü {{ cycle_num }}: VIP hangi node'da (başlangıç)?"
+  shell: "pcs resource status vip | grep Started | awk '{print $NF}'"
+  register: t12_cycle_vip_before
+  changed_when: false
+
+- name: "T12 | Döngü {{ cycle_num }}: Hedef node belirle"
+  set_fact:
+    t12_cycle_source: "{{ t12_cycle_vip_before.stdout | trim }}"
+    t12_cycle_target: >-
+      {{ groups['cluster_nodes'] |
+         reject('equalto', t12_cycle_vip_before.stdout | trim) |
+         list | first }}
+
+- name: "T12 | Döngü {{ cycle_num }}: Başlangıç — {{ t12_cycle_source }} → {{ t12_cycle_target }}"
+  debug:
+    msg: "Döngü {{ cycle_num }}: VIP {{ t12_cycle_source }} → {{ t12_cycle_target }} taşınacak"
+
+# ---- Failover öncesi veri yaz -----------------------------------------------
+- name: "T12 | Döngü {{ cycle_num }}: Veri yaz (kayıt {{ cycle_num }})"
+  shell: |
+    psql -h {{ virtual_ip }} -U postgres -c \
+    "INSERT INTO ha_test_t12 (cycle, node)
+     VALUES ({{ cycle_num }}, '{{ t12_cycle_source | replace('.', '_') }}');"
+  environment:
+    PGPASSWORD: "{{ pgsql_password }}"
+  register: t12_insert
+  changed_when: t12_insert.rc == 0
+  failed_when: t12_insert.rc != 0
+
+# ---- VIP failover -----------------------------------------------------------
+- name: "T12 | Döngü {{ cycle_num }}: VIP taşı → {{ t12_cycle_target }}"
+  command: "pcs resource move vip {{ t12_cycle_target }}"
+  register: t12_move
+  changed_when: true
+
+- name: "T12 | Döngü {{ cycle_num }}: Failover tamamlanmasını bekle ({{ cycle_wait }}s)"
+  command: "pcs resource status vip"
+  register: t12_vip_wait
+  retries: "{{ (cycle_wait / 5) | int }}"
+  delay: 5
+  until: >
+    t12_cycle_target.split('.')[0] in t12_vip_wait.stdout and
+    'Started' in t12_vip_wait.stdout
+  changed_when: false
+
+- name: "T12 | Döngü {{ cycle_num }}: VIP taşındı mı?"
+  assert:
+    that: "t12_cycle_target.split('.')[0] in t12_vip_wait.stdout"
+    success_msg: "✓ Döngü {{ cycle_num }}: VIP → {{ t12_cycle_target }} başarılı"
+    fail_msg: "✗ Döngü {{ cycle_num }}: VIP taşınamadı!\n{{ t12_vip_wait.stdout }}"
+
+# ---- PostgreSQL failover sonrası bağlantı -----------------------------------
+- name: "T12 | Döngü {{ cycle_num }}: PostgreSQL'in yeni node'da başlamasını bekle"
+  command: "pcs resource status postgresql"
+  register: t12_pg_wait
+  retries: 12
+  delay: 5
+  until: "'Started' in t12_pg_wait.stdout"
+  changed_when: false
+
+- name: "T12 | Döngü {{ cycle_num }}: VIP üzerinden bağlantı testi"
+  shell: |
+    psql -h {{ virtual_ip }} -U postgres -At -c \
+    "SELECT count(*) FROM ha_test_t12 WHERE cycle = {{ cycle_num }};"
+  environment:
+    PGPASSWORD: "{{ pgsql_password }}"
+  register: t12_verify
+  retries: 6
+  delay: 5
+  until: t12_verify.rc == 0
+  changed_when: false
+
+- name: "T12 | Döngü {{ cycle_num }}: Veri tutarlılığı doğrula"
+  assert:
+    that: t12_verify.stdout | trim | int == 1
+    success_msg: "✓ Döngü {{ cycle_num }}: kayıt korunmuş (count={{ t12_verify.stdout | trim }})"
+    fail_msg: "✗ Döngü {{ cycle_num }}: veri kaybı! beklenen 1, bulunan {{ t12_verify.stdout | trim }}"
+
+# ---- Geçici constraint kaldır -----------------------------------------------
+- name: "T12 | Döngü {{ cycle_num }}: Location constraint kaldır (sonraki failover için)"
+  command: "pcs resource clear vip"
+  changed_when: true
+  failed_when: false
+
+- name: "T12 | Döngü {{ cycle_num }}: Stabilizasyon bekleme ({{ [cycle_wait / 2, 15] | max | int }}s)"
+  pause:
+    seconds: "{{ [cycle_wait / 2, 15] | max | int }}"
+
+- name: "T12 | Döngü {{ cycle_num }}: Özet"
+  debug:
+    msg: |
+      ✅ Döngü {{ cycle_num }} tamamlandı
+        {{ t12_cycle_source }} → {{ t12_cycle_target }}: başarılı
+        Veri: kayıt {{ cycle_num }} korunmuş

@@ -1,0 +1,29 @@
+---
+# =============================================================================
+# ANSIBLE COLLECTION GEREKSİNİMLERİ
+# =============================================================================
+# Kurulum: ansible-galaxy collection install -r requirements.yml
+# =============================================================================
+
+collections:
+  - name: ansible.utils
+
+  - name: ansible.windows
+
+  - name: ansible.netcommon
+
+
+  # Red Hat HA Cluster System Role
+  - name: redhat.rhel_system_roles
+    version: ">=1.21.0"
+    source: https://galaxy.ansible.com
+
+  # Community genel amaçlı roller
+  - name: ansible.posix
+    version: ">=1.5.0"
+    source: https://galaxy.ansible.com
+
+  # Community genel modüller
+  - name: community.general
+    version: ">=7.0.0"
+    source: https://galaxy.ansible.com

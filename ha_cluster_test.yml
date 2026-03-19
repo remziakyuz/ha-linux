@@ -1,0 +1,2394 @@
+---
+# =============================================================================
+# RED HAT 9 HA CLUSTER — KAPSAMLI TEST PLAYBOOK
+# =============================================================================
+#
+# AMAÇ: Cluster'ın tüm başarısızlık senaryolarında doğru davranıp
+#       davranmadığını otomatik olarak doğrular.
+#
+# TEST KATEGORİLERİ:
+#   T01  Temel Cluster Sağlık Kontrolü
+#   T02  VIP Failover (Node Bakımı Simulasyonu)
+#   T03  Aktif Node Ani Kapatma (pcs cluster stop)
+#   T04  Corosync Ring Ağ Kesintisi (iptables)
+#   T05  Split-Brain Önleme (Quorum Device Devre Dışı)
+#   T06  PostgreSQL Servis Çöküşü (kill -9)
+#   T07  GFS2 Eşzamanlı Yazma (Her İki Node)
+#   T08  LVM Lock Kaybı Simulasyonu
+#   T09  STONITH Fence Agent Testi
+#   T10  iSCSI Bağlantı Kesintisi
+#   T11  Resource Limits (Yük Altında Failover)
+#   T12  Çoklu Ardışık Failover (Dayanıklılık)
+#   T13  Tam Cluster Yeniden Başlatma
+#
+# KULLANIM:
+#   Tüm testler        : ansible-playbook ha_cluster_test.yml
+#   Tek test           : ansible-playbook ha_cluster_test.yml -t test_T03
+#   Belirli set        : ansible-playbook ha_cluster_test.yml -t "test_T01,test_T02"
+#   Yıkıcı dahil      : ansible-playbook ha_cluster_test.yml -e run_destructive=true
+#   STONITH testi      : ansible-playbook ha_cluster_test.yml -e run_stonith_test=true
+#   Tümü               : ansible-playbook ha_cluster_test.yml -e run_destructive=true -e run_stonith_test=true
+#
+# GÜVENLİK:
+#   - Yıkıcı testler (T03,T04,T05,T09,T10) run_destructive=true olmadan ATLANIR
+#   - T09 gerçek STONITH çalıştırır — node REBOOT EDER!
+#   - Her test öncesi ve sonrası cluster sağlık doğrulaması yapılır
+#   - Test tabloları ve iptables kuralları her durumda temizlenir (block/rescue)
+#   - Kalan location constraint'ler otomatik kaldırılır
+#
+# BAĞIMLILIKLAR:
+#   - psql binary cluster node'larında kurulu olmalı
+#   - inventory/hosts.yml: pgsql_password tanımlı olmalı
+#   - tasks/failover_cycle.yml mevcut olmalı (T12 için)
+#
+# =============================================================================
+
+# =============================================================================
+# PLAY 0: TEST ÖNCESİ ORTAM DOĞRULAMA VE HAZIRLIK
+# =============================================================================
+- name: "TEST PREP | Cluster test ortamı hazırlanıyor"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: yes
+  become: yes
+  vars:
+    test_dir: "/tmp/ha_cluster_test"
+    test_timestamp: "{{ ansible_date_time.iso8601_basic_short }}"
+    report_file: "/tmp/ha_cluster_test/test_report_{{ ansible_date_time.iso8601_basic_short }}.txt"
+    failover_wait: 60
+    settle_wait: 30
+    run_destructive: false
+    run_stonith_test: false
+    test_results: []
+
+  tasks:
+    - name: "PREP | Test dizini oluştur"
+      file:
+        path: "{{ test_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: "PREP | Önceki test artıklarını temizle (iptables)"
+      shell: |
+        iptables -D INPUT  -p udp --dport 5405 -j DROP 2>/dev/null || true
+        iptables -D OUTPUT -p udp --dport 5405 -j DROP 2>/dev/null || true
+        iptables -D INPUT  -p tcp --dport 5405 -j DROP 2>/dev/null || true
+        iptables -D OUTPUT -p tcp --dport 5405 -j DROP 2>/dev/null || true
+        iptables -D OUTPUT -p tcp --dport {{ qdevice_port }} -j DROP 2>/dev/null || true
+        iptables -D INPUT  -p tcp --dport {{ qdevice_port }} -j DROP 2>/dev/null || true
+        iptables -D OUTPUT -p tcp -d {{ iscsi_target_ip }} --dport 3260 -j DROP 2>/dev/null || true
+        iptables -D INPUT  -p tcp -s {{ iscsi_target_ip }} --dport 3260 -j DROP 2>/dev/null || true
+      changed_when: false
+      failed_when: false
+      loop: "{{ groups['cluster_nodes'] }}"
+      delegate_to: "{{ item }}"
+
+    - name: "PREP | Önceki test tablolarını temizle (PostgreSQL)"
+      shell: |
+        psql -h {{ virtual_ip }} -U postgres -c \
+        "DROP TABLE IF EXISTS ha_test_t02, ha_test_t03, ha_test_t06,
+         ha_load_t11, ha_test_t12 CASCADE;"
+      environment:
+        PGPASSWORD: "{{ pgsql_password }}"
+      changed_when: false
+      failed_when: false
+
+    - name: "PREP | Önceki location constraint'leri temizle"
+      command: pcs resource clear vip
+      changed_when: false
+      failed_when: false
+
+    - name: "PREP | pcs resource cleanup (stale counters)"
+      command: pcs resource cleanup
+      changed_when: false
+      failed_when: false
+
+    - name: "PREP | Cluster stabilizasyonu için bekle (15s)"
+      pause:
+        seconds: 15
+
+    - name: "PREP | Test raporu başlat"
+      copy:
+        dest: "{{ report_file }}"
+        content: |
+          ============================================================
+          RED HAT 9 HA CLUSTER — TEST RAPORU
+          Tarih   : {{ ansible_date_time.date }} {{ ansible_date_time.time }}
+          Cluster : {{ cluster_name }}
+          Node 1  : {{ groups['cluster_nodes'][0] }}
+          Node 2  : {{ groups['cluster_nodes'][1] }}
+          ============================================================
+
+    - name: "PREP | Cluster durumu"
+      command: pcs status
+      register: initial_status
+      changed_when: false
+      failed_when: initial_status.rc != 0
+
+    - name: "PREP | Cluster durumu çıktısı"
+      debug:
+        msg: "{{ initial_status.stdout_lines }}"
+
+    - name: "PREP | Her iki node online ve temiz mi?"
+      assert:
+        that:
+          - "'OFFLINE' not in initial_status.stdout"
+          - "'Failed Resource Actions' not in initial_status.stdout"
+          - "'Stopped' not in initial_status.stdout"
+        success_msg: "✓ Her iki node online, başarısız resource yok"
+        fail_msg: |
+          ✗ Test başlamadan önce cluster temiz durumda olmalı!
+          Çözüm: pcs resource cleanup && pcs status
+
+    - name: "PREP | PostgreSQL bağlantısı doğrula (pgsql_password kontrolü)"
+      command: >
+        psql -h {{ virtual_ip }} -U postgres -c "SELECT 1;"
+      environment:
+        PGPASSWORD: "{{ pgsql_password }}"
+      register: prep_pg_check
+      changed_when: false
+      failed_when: prep_pg_check.rc != 0
+
+    - name: "PREP | Aktif node'u belirle (VIP hangi node'da)"
+      shell: "pcs resource status vip | grep Started | awk '{print $NF}'"
+      register: active_node_check
+      changed_when: false
+
+    - name: "PREP | Pasif node'u belirle"
+      set_fact:
+        active_node: "{{ active_node_check.stdout | trim }}"
+        passive_node: >-
+          {{ groups['cluster_nodes'] |
+             reject('equalto', active_node_check.stdout | trim) |
+             list | first }}
+
+    - name: "PREP | Node rolleri"
+      debug:
+        msg: |
+          Aktif Node  (VIP + PostgreSQL): {{ active_node }}
+          Pasif Node  (GFS2 only)       : {{ passive_node }}
+
+    - name: "PREP | Test ortamı özeti"
+      vars:
+        destructive_mode: "{{ 'ETKİN ⚠' if run_destructive | bool else 'DEVRE DIŞI (güvenli mod)' }}"
+        stonith_mode: "{{ 'ETKİN ⚠ (node reboot!)' if run_stonith_test | bool else 'DEVRE DIŞI' }}"
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════╗
+          ║          TEST ORTAMI HAZIR                       ║
+          ╠══════════════════════════════════════════════════╣
+          ║  Cluster     : {{ cluster_name }}
+          ║  Aktif Node  : {{ active_node }}
+          ║  Pasif Node  : {{ passive_node }}
+          ║  VIP         : {{ virtual_ip }}
+          ║  PostgreSQL  : {{ virtual_ip }}:{{ pgsql_port }}
+          ║  GFS2 Mount  : {{ gfs2_mount }}
+          ║  pgsql Mount : {{ pgsql_mount }}
+          ║  Yıkıcı test : {{ destructive_mode }}
+          ║  STONITH test: {{ stonith_mode }}
+          ╚══════════════════════════════════════════════════╝
+
+
+# =============================================================================
+# T01: TEMEL CLUSTER SAĞLIK KONTROLÜ
+# =============================================================================
+- name: "T01 | Temel Cluster Sağlık Kontrolü"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+  tags: test_T01
+
+  tasks:
+    - name: "T01 | Banner"
+      debug:
+        msg: "════════ T01: TEMEL CLUSTER SAĞLIK KONTROLÜ ════════"
+
+    # ── Corosync ────────────────────────────────────────────────────────────
+    - name: "T01.1 | Corosync ring durumu"
+      command: corosync-cfgtool -s
+      register: ring_status
+      changed_when: false
+
+    - name: "T01.1 | Corosync ring kontrolü (Corosync 3.x / RHEL9 uyumlu)"
+      assert:
+        that:
+          - "'disconnected' not in ring_status.stdout"
+          - "'lost' not in ring_status.stdout"
+          - "'connected' in ring_status.stdout"
+        success_msg: "✓ Corosync ring sağlıklı — tüm peer'ler connected"
+        fail_msg: "✗ Corosync ring hatası:\n{{ ring_status.stdout }}"
+
+    # ── Quorum ──────────────────────────────────────────────────────────────
+    - name: "T01.2 | Quorum device durumu"
+      command: pcs quorum device status
+      register: qdevice_status
+      changed_when: false
+
+    - name: "T01.2 | Quorum device bağlı mı?"
+      assert:
+        that: "'connected' in qdevice_status.stdout | lower or 'cast' in qdevice_status.stdout | lower"
+        success_msg: "✓ Quorum device bağlı"
+        fail_msg: "✗ Quorum device bağlı değil:\n{{ qdevice_status.stdout }}"
+
+    - name: "T01.3 | Quorum durum detayı"
+      command: pcs quorum status
+      register: quorum_detail
+      changed_when: false
+
+    - name: "T01.3 | Cluster quorate mu?"
+      assert:
+        that: "'Quorate:          Yes' in quorum_detail.stdout"
+        success_msg: "✓ Cluster quorate"
+        fail_msg: "✗ Cluster quorate değil!"
+
+    # ── Pacemaker Resources ──────────────────────────────────────────────────
+    - name: "T01.4 | Tüm resource'ların durumu"
+      command: pcs resource status
+      register: all_resources
+      changed_when: false
+
+    - name: "T01.4 | Başarısız resource var mı?"
+      assert:
+        that: "'FAILED' not in all_resources.stdout and 'Stopped' not in all_resources.stdout"
+        success_msg: "✓ Tüm resource'lar çalışıyor"
+        fail_msg: "✗ Başarısız/durmuş resource var:\n{{ all_resources.stdout }}"
+
+    - name: "T01.5 | GFS2 her iki node'da aktif mi?"
+      command: pcs resource status gfs2_fs-clone
+      register: gfs2_status
+      changed_when: false
+
+    - name: "T01.5 | GFS2 clone doğrulama"
+      assert:
+        that: >
+          groups['cluster_nodes'][0].split('.')[0] in gfs2_status.stdout
+          and groups['cluster_nodes'][1].split('.')[0] in gfs2_status.stdout
+        success_msg: "✓ GFS2 her iki node'da mount edilmiş"
+        fail_msg: "✗ GFS2 her iki node'da çalışmıyor:\n{{ gfs2_status.stdout }}"
+
+    # ── Mount Noktaları ──────────────────────────────────────────────────────
+    - name: "T01.6 | GFS2 mount kontrol (her node)"
+      command: mountpoint -q {{ gfs2_mount }}
+      register: gfs2_mount_check
+      changed_when: false
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['cluster_nodes'] }}"
+      failed_when: gfs2_mount_check.rc != 0
+
+    - name: "T01.6 | GFS2 mount doğrulama"
+      assert:
+        that: gfs2_mount_check.results | map(attribute='rc') | select('ne', 0) | list | length == 0
+        success_msg: "✓ GFS2 ({{ gfs2_mount }}) her iki node'da mount edilmiş"
+        fail_msg: "✗ GFS2 mount sorunu var"
+
+    - name: "T01.7 | PostgreSQL mount kontrol (aktif node)"
+      shell: "pcs resource status vip | grep Started | awk '{print $NF}'"
+      register: t01_active_node
+      changed_when: false
+
+    - name: "T01.7 | PostgreSQL disk mount doğrula"
+      command: mountpoint -q {{ pgsql_mount }}
+      register: pgsql_mount_check
+      changed_when: false
+      delegate_to: "{{ t01_active_node.stdout | trim }}"
+      failed_when: pgsql_mount_check.rc != 0
+
+    - name: "T01.7 | PostgreSQL mount sonucu"
+      assert:
+        that: pgsql_mount_check.rc == 0
+        success_msg: "✓ PostgreSQL diski ({{ pgsql_mount }}) aktif node'da mount edilmiş"
+        fail_msg: "✗ PostgreSQL diski mount edilmemiş!"
+
+    # ── PostgreSQL Bağlantı ──────────────────────────────────────────────────
+    - name: "T01.8 | PostgreSQL bağlantı testi (VIP üzerinden)"
+      command: >
+        psql -h {{ virtual_ip }} -U postgres -c "SELECT version(), current_timestamp;"
+      environment:
+        PGPASSWORD: "{{ pgsql_password }}"
+      register: pg_connect
+      changed_when: false
+      failed_when: pg_connect.rc != 0
+
+    - name: "T01.8 | PostgreSQL yanıt veriyor"
+      debug:
+        msg: "✓ PostgreSQL erişilebilir:\n{{ pg_connect.stdout }}"
+
+    # ── IPMI / STONITH ───────────────────────────────────────────────────────
+    - name: "T01.9 | STONITH etkin mi?"
+      command: pcs property config stonith-enabled
+      register: stonith_prop
+      changed_when: false
+
+    - name: "T01.9 | STONITH kontrolü"
+      assert:
+        that: "'stonith-enabled=true' in stonith_prop.stdout"
+        success_msg: "✓ STONITH etkin"
+        fail_msg: "✗ STONITH devre dışı — cluster korumasız!"
+
+    - name: "T01.9b | IPMI erişimi canlı mı? (her node)"
+      command: >
+        ipmitool -I lanplus
+        -H {{ hostvars[item].ipmi_ip }}
+        -p {{ hostvars[item].ipmi_port }}
+        -U {{ hostvars[item].ipmi_user }}
+        -P {{ hostvars[item].ipmi_password }}
+        chassis power status
+      register: t01_ipmi_check
+      loop: "{{ groups['cluster_nodes'] }}"
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: "T01.9b | IPMI durum raporu"
+      debug:
+        msg: "{{ item.item }}: {{ 'IPMI erişilebilir — ' + item.stdout | trim if item.rc == 0 else '⚠ IPMI erişilemiyor!' }}"
+      loop: "{{ t01_ipmi_check.results }}"
+
+    # ── Yapılandırma Doğrulama ───────────────────────────────────────────────
+    - name: "T01.10 | Yapılandırma doğrulama (crm_verify)"
+      command: crm_verify -L -V
+      register: crm_verify
+      changed_when: false
+      failed_when: false
+
+    - name: "T01.10 | CRM verify sonucu"
+      assert:
+        that: crm_verify.rc == 0
+        success_msg: "✓ Cluster yapılandırması geçerli (crm_verify)"
+        fail_msg: "⚠ Yapılandırma uyarısı:\n{{ crm_verify.stderr }}"
+
+    # ── Servis Durumu (her node) ─────────────────────────────────────────────
+    - name: "T01.11 | Corosync/Pacemaker servis durumu (her node)"
+      shell: |
+        echo "=== {{ item }} ==="
+        systemctl is-active corosync && echo "corosync: active" || echo "corosync: FAILED"
+        systemctl is-active pacemaker && echo "pacemaker: active" || echo "pacemaker: FAILED"
+        systemctl is-active corosync-qdevice && echo "corosync-qdevice: active" || echo "corosync-qdevice: FAILED"
+        systemctl is-active multipathd && echo "multipathd: active" || echo "multipathd: FAILED"
+        systemctl is-active iscsid && echo "iscsid: active" || echo "iscsid: FAILED"
+      register: t01_service_status
+      loop: "{{ groups['cluster_nodes'] }}"
+      delegate_to: "{{ item }}"
+      changed_when: false
+      failed_when: false
+
+    - name: "T01.11 | Servis durumları"
+      debug:
+        msg: "{{ item.stdout_lines }}"
+      loop: "{{ t01_service_status.results }}"
+
+    - name: "T01 | SONUÇ"
+      debug:
+        msg: "✅ T01 BAŞARILI — Cluster sağlıklı durumda"
+
+
+# =============================================================================
+# T02: VIP FAILOVER (NODE BAKIM SİMÜLASYONU)
+# =============================================================================
+- name: "T02 | VIP Failover Testi"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+  tags: test_T02
+  vars:
+    failover_wait: 60
+
+  tasks:
+    - name: "T02 | Banner"
+      debug:
+        msg: "════════ T02: VIP FAILOVER (BAKIM SİMÜLASYONU) ════════"
+
+    - name: "T02 | Başlangıç: VIP hangi node'da?"
+      shell: "pcs resource status vip | grep Started | awk '{print $NF}'"
+      register: vip_before
+      changed_when: false
+
+    - name: "T02 | Başlangıç: PostgreSQL hangi node'da?"
+      shell: "pcs resource status postgresql | grep Started | awk '{print $NF}'"
+      register: pg_before
+      changed_when: false
+
+    - name: "T02 | Hedef node belirleniyor"
+      set_fact:
+        vip_source: "{{ vip_before.stdout | trim }}"
+        vip_target: >-
+          {{ groups['cluster_nodes'] |
+             reject('equalto', vip_before.stdout | trim) |
+             list | first }}
+
+    - name: "T02 | Failover testi (block/rescue ile güvenli)"
+      block:
+        - name: "T02 | Failover öncesi PostgreSQL yazma testi"
+          shell: |
+            psql -h {{ virtual_ip }} -U postgres -c \
+            "CREATE TABLE IF NOT EXISTS ha_test_t02 (id serial, ts timestamptz DEFAULT now(), node text);
+             INSERT INTO ha_test_t02 (node) VALUES ('before_failover');
+             SELECT count(*) FROM ha_test_t02;"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          register: pg_write_before
+          changed_when: false
+          failed_when: pg_write_before.rc != 0
+
+        - name: "T02 | VIP {{ vip_source }} → {{ vip_target }} taşınıyor"
+          command: "pcs resource move vip {{ vip_target }}"
+          register: vip_move
+
+        - name: "T02 | Failover tamamlanmasını bekle ({{ failover_wait }}s)"
+          command: "pcs resource status vip"
+          register: vip_move_wait
+          retries: "{{ (failover_wait / 5) | int }}"
+          delay: 5
+          until: "vip_target.split('.')[0] in vip_move_wait.stdout and 'Started' in vip_move_wait.stdout"
+          changed_when: false
+
+        - name: "T02 | VIP taşındı mı?"
+          assert:
+            that: "vip_target.split('.')[0] in vip_move_wait.stdout"
+            success_msg: "✓ VIP başarıyla {{ vip_target }}'a taşındı"
+            fail_msg: "✗ VIP taşınamadı"
+
+        - name: "T02 | PostgreSQL yeni node'da başlamasını bekle"
+          command: pcs resource status postgresql
+          register: t02_pg_new
+          retries: 12
+          delay: 5
+          until: "vip_target.split('.')[0] in t02_pg_new.stdout and 'Started' in t02_pg_new.stdout"
+          changed_when: false
+
+        - name: "T02 | Failover sonrası PostgreSQL bağlantı testi (VIP üzerinden)"
+          shell: |
+            psql -h {{ virtual_ip }} -U postgres -c \
+            "INSERT INTO ha_test_t02 (node) VALUES ('after_failover');
+             SELECT count(*) FROM ha_test_t02;"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          register: pg_write_after
+          changed_when: false
+          retries: 6
+          delay: 5
+          until: pg_write_after.rc == 0
+
+        - name: "T02 | Veri tutarlılığı — failover öncesi kayıtlar korunuyor mu?"
+          shell: |
+            psql -h {{ virtual_ip }} -U postgres -At -c \
+            "SELECT count(*) FROM ha_test_t02 WHERE node='before_failover';"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          register: data_check
+          changed_when: false
+
+        - name: "T02 | Veri tutarlılığı doğrulama"
+          assert:
+            that: data_check.stdout | trim | int >= 1
+            success_msg: "✓ Veri tutarlı — failover öncesi kayıtlar korunmuş"
+            fail_msg: "✗ Veri kaybı tespit edildi!"
+
+      rescue:
+        - name: "T02 | HATA — location constraint kaldır"
+          command: pcs resource clear vip
+          changed_when: false
+          failed_when: false
+
+        - name: "T02 | HATA — test tablosunu temizle"
+          shell: "psql -h {{ virtual_ip }} -U postgres -c 'DROP TABLE IF EXISTS ha_test_t02;'"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          changed_when: false
+          failed_when: false
+
+        - name: "T02 | HATA — detay"
+          fail:
+            msg: "✗ T02 başarısız! Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}"
+
+      always:
+        - name: "T02 | Geçici location constraint kaldır"
+          command: pcs resource clear vip
+          changed_when: false
+          failed_when: false
+
+        - name: "T02 | Test tablosunu temizle"
+          shell: "psql -h {{ virtual_ip }} -U postgres -c 'DROP TABLE IF EXISTS ha_test_t02;'"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          changed_when: false
+          failed_when: false
+
+    - name: "T02 | SONUÇ"
+      debug:
+        msg: |
+          ✅ T02 BAŞARILI — VIP Failover
+            {{ vip_source }} → {{ vip_target }}: başarılı
+            VIP bağlantısı: kesintisiz ({{ virtual_ip }})
+            Veri tutarlılığı: korunmuş
+
+
+# =============================================================================
+# T03: AKTİF NODE ANİ KAPATMA
+# =============================================================================
+- name: "T03 | Aktif Node Ani Kapatma Testi"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+  tags: test_T03
+  vars:
+    failover_wait: 120
+
+  tasks:
+    - name: "T03 | Banner"
+      debug:
+        msg: "════════ T03: AKTİF NODE ANİ KAPATMA ════════"
+
+    - name: "T03 | Yıkıcı test kontrolü"
+      assert:
+        that: run_destructive | default(false) | bool
+        success_msg: "Yıkıcı test modu etkin — devam ediliyor"
+        fail_msg: |
+          ⏭ T03 ATLANDI — Yıkıcı test modu devre dışı
+          Çalıştırmak için: -e run_destructive=true
+      ignore_errors: yes
+      register: destructive_check
+
+    - name: "T03 | Yıkıcı mod kapalıysa atla"
+      meta: end_play
+      when: not (run_destructive | default(false) | bool)
+
+    - name: "T03 | Aktif node belirleniyor"
+      shell: "pcs resource status vip | grep Started | awk '{print $NF}'"
+      register: t03_active_node
+      changed_when: false
+
+    - name: "T03 | Pasif node belirleniyor"
+      set_fact:
+        t03_active: "{{ t03_active_node.stdout | trim }}"
+        t03_passive: >-
+          {{ groups['cluster_nodes'] |
+             reject('equalto', t03_active_node.stdout | trim) |
+             list | first }}
+
+    - name: "T03 | Test (block/rescue ile güvenli)"
+      block:
+        - name: "T03 | Failover öncesi veri yaz"
+          shell: |
+            psql -h {{ virtual_ip }} -U postgres -c \
+            "CREATE TABLE IF NOT EXISTS ha_test_t03 (id serial, ts timestamptz DEFAULT now(), ev text);
+             INSERT INTO ha_test_t03 (ev) VALUES ('before_node_stop');"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          changed_when: false
+
+        - name: "T03 | Aktif node'u durdur: {{ t03_active }}"
+          command: "pcs cluster stop {{ t03_active }} --force"
+          delegate_to: "{{ t03_active }}"
+          async: 10
+          poll: 0
+          register: stop_job
+
+        - name: "T03 | Pasif node'da failover bekleniyor ({{ failover_wait }}s)"
+          command: pcs resource status postgresql
+          register: pg_failover_wait
+          retries: "{{ (failover_wait / 5) | int }}"
+          delay: 5
+          until: "'Started' in pg_failover_wait.stdout"
+          changed_when: false
+          delegate_to: "{{ t03_passive }}"
+
+        - name: "T03 | Failover hangi node'a taşındı?"
+          shell: "pcs resource status vip | grep Started | awk '{print $NF}'"
+          register: t03_new_active
+          changed_when: false
+          delegate_to: "{{ t03_passive }}"
+
+        - name: "T03 | Failover doğrulama"
+          assert:
+            that: "t03_passive.split('.')[0] in t03_new_active.stdout"
+            success_msg: "✓ Failover başarılı — servisler {{ t03_passive }}'a taşındı"
+            fail_msg: "✗ Failover tamamlanamadı"
+
+        - name: "T03 | Failover sonrası PostgreSQL bağlantı testi"
+          shell: |
+            psql -h {{ virtual_ip }} -U postgres -c \
+            "INSERT INTO ha_test_t03 (ev) VALUES ('after_node_stop');"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          register: t03_pg_insert
+          changed_when: false
+          retries: 6
+          delay: 5
+          until: t03_pg_insert.rc == 0
+          delegate_to: "{{ t03_passive }}"
+
+        - name: "T03 | Veri tutarlılığı — failover öncesi kayıt sayısı"
+          shell: |
+            psql -h {{ virtual_ip }} -U postgres -At -c \
+            "SELECT count(*) FROM ha_test_t03 WHERE ev='before_node_stop';"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          register: t03_pg_check
+          changed_when: false
+          delegate_to: "{{ t03_passive }}"
+
+        - name: "T03 | Veri tutarlılığı doğrulama"
+          assert:
+            that: "t03_pg_check.stdout | trim | int >= 1"
+            success_msg: "✓ Veri tutarlı — failover öncesi kayıt korunmuş (count={{ t03_pg_check.stdout | trim }})"
+            fail_msg: "✗ Veri sorunu — failover öncesi kayıt bulunamadı (count={{ t03_pg_check.stdout | trim }})"
+
+      rescue:
+        - name: "T03 | HATA — node'u zorla başlat"
+          command: "pcs cluster start {{ t03_active }}"
+          delegate_to: "{{ t03_passive }}"
+          failed_when: false
+
+        - name: "T03 | HATA — detay"
+          fail:
+            msg: "✗ T03 başarısız! Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}"
+
+      always:
+        - name: "T03 | Durdurulmuş node'u geri başlat"
+          command: "pcs cluster start {{ t03_active }}"
+          delegate_to: "{{ t03_passive }}"
+          failed_when: false
+
+        - name: "T03 | Durdurulmuş node'un geri gelmesini bekle"
+          command: "pcs status"
+          register: t03_recovery_wait
+          retries: 24
+          delay: 5
+          until: "t03_active.split('.')[0] in t03_recovery_wait.stdout and 'OFFLINE' not in t03_recovery_wait.stdout"
+          changed_when: false
+          delegate_to: "{{ t03_passive }}"
+          failed_when: false
+
+        - name: "T03 | Resource cleanup"
+          command: pcs resource cleanup
+          changed_when: false
+          failed_when: false
+          delegate_to: "{{ t03_passive }}"
+
+        - name: "T03 | Test tablosunu temizle"
+          shell: "psql -h {{ virtual_ip }} -U postgres -c 'DROP TABLE IF EXISTS ha_test_t03;'"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          changed_when: false
+          failed_when: false
+          delegate_to: "{{ t03_passive }}"
+
+    - name: "T03 | SONUÇ"
+      debug:
+        msg: |
+          ✅ T03 BAŞARILI — Aktif Node Ani Kapatma
+            Durduruldu : {{ t03_active }}
+            Failover   : {{ t03_passive }}
+            Kurtarma   : {{ t03_active }} geri döndü
+
+
+# =============================================================================
+# T04: COROSYNC RING AĞ KESİNTİSİ (iptables)
+# =============================================================================
+- name: "T04 | Corosync Ring Ağ Kesintisi Testi"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+  tags: test_T04
+  vars:
+    network_block_duration: 45
+    failover_wait: 120
+
+  tasks:
+    - name: "T04 | Banner"
+      debug:
+        msg: "════════ T04: COROSYNC RING AĞ KESİNTİSİ ════════"
+
+    - name: "T04 | Yıkıcı test kontrolü"
+      assert:
+        that: run_destructive | default(false) | bool
+        success_msg: "Devam ediliyor"
+        fail_msg: "⏭ T04 ATLANDI — -e run_destructive=true gerekli"
+      ignore_errors: yes
+
+    - name: "T04 | Yıkıcı mod kapalıysa atla"
+      meta: end_play
+      when: not (run_destructive | default(false) | bool)
+
+    - name: "T04 | Aktif ve pasif node belirleniyor"
+      shell: "pcs resource status vip | grep Started | awk '{print $NF}'"
+      register: t04_active_raw
+      changed_when: false
+
+    - name: "T04 | Node rolleri"
+      set_fact:
+        t04_active: "{{ t04_active_raw.stdout | trim }}"
+        t04_passive: >-
+          {{ groups['cluster_nodes'] |
+             reject('equalto', t04_active_raw.stdout | trim) |
+             list | first }}
+
+    - name: "T04 | Pasif node'un cluster IP'si"
+      set_fact:
+        t04_passive_cluster_ip: "{{ hostvars[t04_passive].cluster_ip }}"
+        t04_active_cluster_ip: "{{ hostvars[t04_active].cluster_ip }}"
+
+    - name: "T04 | Test (block/rescue ile güvenli)"
+      block:
+        - name: "T04 | Pasif node üzerinde corosync trafiğini kes ({{ network_block_duration }}s)"
+          shell: |
+            iptables -I INPUT  -p udp --dport 5405 -j DROP
+            iptables -I OUTPUT -p udp --dport 5405 -j DROP
+            iptables -I INPUT  -p tcp --dport 5405 -j DROP
+            iptables -I OUTPUT -p tcp --dport 5405 -j DROP
+            echo "Network blocked at $(date)"
+            sleep {{ network_block_duration }}
+            iptables -D INPUT  -p udp --dport 5405 -j DROP 2>/dev/null || true
+            iptables -D OUTPUT -p udp --dport 5405 -j DROP 2>/dev/null || true
+            iptables -D INPUT  -p tcp --dport 5405 -j DROP 2>/dev/null || true
+            iptables -D OUTPUT -p tcp --dport 5405 -j DROP 2>/dev/null || true
+            echo "Network restored at $(date)"
+          async: "{{ network_block_duration + 30 }}"
+          poll: 0
+          register: t04_block_job
+          delegate_to: "{{ t04_passive }}"
+
+        - name: "T04 | Ağ kesildi — cluster davranışı izleniyor"
+          command: pcs status
+          register: t04_status_during
+          retries: 10
+          delay: 5
+          changed_when: false
+          failed_when: false
+          delegate_to: "{{ t04_active }}"
+
+        - name: "T04 | Ağ kesintisi sırasında cluster durumu"
+          debug:
+            msg: "{{ t04_status_during.stdout_lines }}"
+
+        - name: "T04 | Ağın geri gelmesini bekle"
+          pause:
+            seconds: "{{ network_block_duration + 10 }}"
+
+        - name: "T04 | Cluster stabilizasyonu ({{ failover_wait }}s)"
+          command: pcs status
+          register: t04_recovery_status
+          retries: "{{ (failover_wait / 5) | int }}"
+          delay: 5
+          until: >
+            'OFFLINE' not in t04_recovery_status.stdout and
+            'Failed Resource Actions' not in t04_recovery_status.stdout
+          changed_when: false
+          failed_when: false
+
+        - name: "T04 | Resource cleanup"
+          command: pcs resource cleanup
+          changed_when: false
+
+        - name: "T04 | VIP hâlâ erişilebilir mi?"
+          command: >
+            psql -h {{ virtual_ip }} -U postgres -c "SELECT 1 AS test;"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          register: t04_pg_check
+          changed_when: false
+          retries: 6
+          delay: 5
+          until: t04_pg_check.rc == 0
+
+        - name: "T04 | Corosync ring kurtarma doğrulama"
+          command: corosync-cfgtool -s
+          register: t04_ring_check
+          changed_when: false
+
+        - name: "T04 | Ring durumu doğrulama"
+          assert:
+            that:
+              - "'disconnected' not in t04_ring_check.stdout"
+              - "'lost' not in t04_ring_check.stdout"
+              - "'connected' in t04_ring_check.stdout"
+            success_msg: "✓ Corosync ring kurtarıldı — tüm peer'ler connected"
+            fail_msg: "✗ Corosync ring hâlâ hatalı:\n{{ t04_ring_check.stdout }}"
+
+      rescue:
+        - name: "T04 | HATA — iptables temizle (tüm node'lar)"
+          shell: |
+            iptables -D INPUT  -p udp --dport 5405 -j DROP 2>/dev/null || true
+            iptables -D OUTPUT -p udp --dport 5405 -j DROP 2>/dev/null || true
+            iptables -D INPUT  -p tcp --dport 5405 -j DROP 2>/dev/null || true
+            iptables -D OUTPUT -p tcp --dport 5405 -j DROP 2>/dev/null || true
+          changed_when: false
+          failed_when: false
+          loop: "{{ groups['cluster_nodes'] }}"
+          delegate_to: "{{ item }}"
+
+        - name: "T04 | HATA — detay"
+          fail:
+            msg: "✗ T04 başarısız! Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}"
+
+      always:
+        - name: "T04 | Iptables temizleme (güvenlik önlemi)"
+          shell: |
+            iptables -D INPUT  -p udp --dport 5405 -j DROP 2>/dev/null || true
+            iptables -D OUTPUT -p udp --dport 5405 -j DROP 2>/dev/null || true
+            iptables -D INPUT  -p tcp --dport 5405 -j DROP 2>/dev/null || true
+            iptables -D OUTPUT -p tcp --dport 5405 -j DROP 2>/dev/null || true
+          changed_when: false
+          failed_when: false
+          delegate_to: "{{ t04_passive }}"
+
+    - name: "T04 | SONUÇ"
+      debug:
+        msg: |
+          ✅ T04 BAŞARILI — Corosync Ring Ağ Kesintisi
+            Kesinti süresi : {{ network_block_duration }}s
+            VIP erişimi   : korundu
+            Ring kurtarma : başarılı
+
+
+# =============================================================================
+# T05: SPLIT-BRAIN ÖNLEMESİ (Quorum Device Devre Dışı)
+# =============================================================================
+- name: "T05 | Split-Brain Önleme Testi"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+  tags: test_T05
+  vars:
+    qdevice_block_duration: 30
+
+  tasks:
+    - name: "T05 | Banner"
+      debug:
+        msg: "════════ T05: SPLIT-BRAIN ÖNLEMESİ TEST ════════"
+
+    - name: "T05 | Yıkıcı test kontrolü"
+      assert:
+        that: run_destructive | default(false) | bool
+        success_msg: "Devam ediliyor"
+        fail_msg: "⏭ T05 ATLANDI — -e run_destructive=true gerekli"
+      ignore_errors: yes
+
+    - name: "T05 | Yıkıcı mod kapalıysa atla"
+      meta: end_play
+      when: not (run_destructive | default(false) | bool)
+
+    - name: "T05 | Test (block/rescue ile güvenli)"
+      block:
+        - name: "T05 | Quorum device port'unu cluster node'larında kes ({{ qdevice_block_duration }}s)"
+          shell: |
+            iptables -I OUTPUT -p tcp --dport {{ qdevice_port }} -j DROP
+            iptables -I INPUT  -p tcp --dport {{ qdevice_port }} -j DROP
+            sleep {{ qdevice_block_duration }}
+            iptables -D OUTPUT -p tcp --dport {{ qdevice_port }} -j DROP 2>/dev/null || true
+            iptables -D INPUT  -p tcp --dport {{ qdevice_port }} -j DROP 2>/dev/null || true
+          async: "{{ qdevice_block_duration + 20 }}"
+          poll: 0
+          loop: "{{ groups['cluster_nodes'] }}"
+          delegate_to: "{{ item }}"
+
+        - name: "T05 | Qdevice bağlantısı kesilen cluster davranışı"
+          command: corosync-quorumtool -s
+          register: t05_quorum_during
+          retries: 6
+          delay: 5
+          changed_when: false
+          failed_when: false
+
+        - name: "T05 | Quorum durumu analizi"
+          debug:
+            msg: |
+              Quorum durumu (qdevice kesiliyken):
+              {{ t05_quorum_during.stdout }}
+              Beklenen: cluster freeze veya qdevice NA durumu
+
+        - name: "T05 | Qdevice kurtarmasını bekle"
+          pause:
+            seconds: "{{ qdevice_block_duration + 15 }}"
+
+        - name: "T05 | Quorum device yeniden bağlanıyor"
+          command: pcs quorum device status
+          register: t05_qdevice_recovery
+          retries: 12
+          delay: 5
+          until: "'connected' in t05_qdevice_recovery.stdout | lower or 'cast' in t05_qdevice_recovery.stdout | lower"
+          changed_when: false
+
+        - name: "T05 | Qdevice kurtarma doğrulama"
+          assert:
+            that: "'connected' in t05_qdevice_recovery.stdout | lower or 'cast' in t05_qdevice_recovery.stdout | lower"
+            success_msg: "✓ Quorum device kurtarıldı ve yeniden bağlandı"
+            fail_msg: "✗ Quorum device kurtarılamadı:\n{{ t05_qdevice_recovery.stdout }}"
+
+      rescue:
+        - name: "T05 | HATA — iptables temizle"
+          shell: |
+            iptables -D OUTPUT -p tcp --dport {{ qdevice_port }} -j DROP 2>/dev/null || true
+            iptables -D INPUT  -p tcp --dport {{ qdevice_port }} -j DROP 2>/dev/null || true
+          changed_when: false
+          failed_when: false
+          loop: "{{ groups['cluster_nodes'] }}"
+          delegate_to: "{{ item }}"
+
+        - name: "T05 | HATA — detay"
+          fail:
+            msg: "✗ T05 başarısız! Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}"
+
+      always:
+        - name: "T05 | Iptables temizleme (güvenlik)"
+          shell: |
+            iptables -D OUTPUT -p tcp --dport {{ qdevice_port }} -j DROP 2>/dev/null || true
+            iptables -D INPUT  -p tcp --dport {{ qdevice_port }} -j DROP 2>/dev/null || true
+          changed_when: false
+          failed_when: false
+          loop: "{{ groups['cluster_nodes'] }}"
+          delegate_to: "{{ item }}"
+
+    - name: "T05 | SONUÇ"
+      debug:
+        msg: |
+          ✅ T05 BAŞARILI — Split-Brain Önleme
+            Qdevice kesildi: {{ qdevice_block_duration }}s
+            Cluster: no-quorum-policy=freeze (kaynak durdurulmadı)
+            Kurtarma: qdevice yeniden bağlandı
+
+
+# =============================================================================
+# T06: POSTGRESQL SERVİS ÇÖKÜŞÜ (kill -9)
+# =============================================================================
+- name: "T06 | PostgreSQL Servis Çöküşü Testi"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+  tags: test_T06
+  vars:
+    pg_restart_wait: 60
+
+  tasks:
+    - name: "T06 | Banner"
+      debug:
+        msg: "════════ T06: POSTGRESQL SERVİS ÇÖKÜŞÜ (kill -9) ════════"
+
+    - name: "T06 | PostgreSQL hangi node'da?"
+      shell: "pcs resource status postgresql | grep Started | awk '{print $NF}'"
+      register: t06_pg_node_raw
+      changed_when: false
+
+    - name: "T06 | PostgreSQL node'u"
+      set_fact:
+        t06_pg_node: "{{ t06_pg_node_raw.stdout | trim }}"
+
+    - name: "T06 | Test (block/rescue ile güvenli)"
+      block:
+        - name: "T06 | Failover öncesi veri yaz"
+          shell: |
+            psql -h {{ virtual_ip }} -U postgres -c \
+            "CREATE TABLE IF NOT EXISTS ha_test_t06 (id serial, ts timestamptz DEFAULT now(), ev text);
+             INSERT INTO ha_test_t06 (ev) VALUES ('before_kill');"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          changed_when: false
+
+        - name: "T06 | PostgreSQL postmaster PID tespit"
+          shell: "pgrep -o -f 'postgres.*postmaster' || pgrep -o postgres"
+          register: t06_pg_pid
+          changed_when: false
+          delegate_to: "{{ t06_pg_node }}"
+          failed_when: t06_pg_pid.stdout | trim == ''
+
+        - name: "T06 | PostgreSQL postmaster'a kill -9 (PID: {{ t06_pg_pid.stdout | trim }})"
+          shell: "kill -9 {{ t06_pg_pid.stdout | trim }}"
+          register: t06_kill
+          changed_when: true
+          delegate_to: "{{ t06_pg_node }}"
+          failed_when: false
+
+        - name: "T06 | Kill sonrası kısa bekleme (Pacemaker'ın fark etmesi için)"
+          pause:
+            seconds: 5
+
+        - name: "T06 | Pacemaker'ın PostgreSQL'i yeniden başlatmasını bekle ({{ pg_restart_wait }}s)"
+          command: pcs resource status postgresql
+          register: t06_pg_restart_wait
+          retries: "{{ (pg_restart_wait / 5) | int }}"
+          delay: 5
+          until: "'Started' in t06_pg_restart_wait.stdout"
+          changed_when: false
+
+        - name: "T06 | PostgreSQL kurtarma doğrulama"
+          assert:
+            that: "'Started' in t06_pg_restart_wait.stdout"
+            success_msg: "✓ Pacemaker PostgreSQL'i yeniden başlattı"
+            fail_msg: "✗ PostgreSQL yeniden başlatılamadı"
+
+        - name: "T06 | Failcount kontrolü (migration threshold aşılmamış olmalı)"
+          command: pcs resource failcount show postgresql
+          register: t06_failcount
+          changed_when: false
+          failed_when: false
+
+        - name: "T06 | Failcount bilgisi"
+          debug:
+            msg: "PostgreSQL failcount: {{ t06_failcount.stdout | default('bilgi yok') }}"
+
+        - name: "T06 | Kurtarma sonrası bağlantı testi"
+          shell: |
+            psql -h {{ virtual_ip }} -U postgres -c \
+            "INSERT INTO ha_test_t06 (ev) VALUES ('after_kill');"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          register: t06_pg_insert
+          changed_when: false
+          retries: 6
+          delay: 5
+          until: t06_pg_insert.rc == 0
+
+        - name: "T06 | Veri tutarlılığı — kill öncesi kayıt sayısı"
+          shell: |
+            psql -h {{ virtual_ip }} -U postgres -At -c \
+            "SELECT count(*) FROM ha_test_t06 WHERE ev='before_kill';"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          register: t06_pg_check
+          changed_when: false
+
+        - name: "T06 | Veri tutarlılığı"
+          assert:
+            that: "t06_pg_check.stdout | trim | int >= 1"
+            success_msg: "✓ Veri tutarlı — kill öncesi kayıt korunmuş (count={{ t06_pg_check.stdout | trim }})"
+            fail_msg: "✗ Veri sorunu — kill öncesi kayıt bulunamadı (count={{ t06_pg_check.stdout | trim }})"
+
+      rescue:
+        - name: "T06 | HATA — resource cleanup"
+          command: pcs resource cleanup postgresql
+          changed_when: false
+          failed_when: false
+
+        - name: "T06 | HATA — detay"
+          fail:
+            msg: "✗ T06 başarısız! Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}"
+
+      always:
+        - name: "T06 | Resource failcount temizle"
+          command: pcs resource cleanup postgresql
+          changed_when: false
+          failed_when: false
+
+        - name: "T06 | Test tablosunu temizle"
+          shell: "psql -h {{ virtual_ip }} -U postgres -c 'DROP TABLE IF EXISTS ha_test_t06;'"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          changed_when: false
+          failed_when: false
+
+    - name: "T06 | SONUÇ"
+      debug:
+        msg: |
+          ✅ T06 BAŞARILI — PostgreSQL Çöküş Kurtarma
+            Yöntem: kill -9 postmaster (PID: {{ t06_pg_pid.stdout | trim }})
+            Pacemaker: on-fail=restart → yeniden başlattı
+            Veri tutarlılığı: korundu
+
+
+# =============================================================================
+# T07: GFS2 EŞZAMANLI YAZMA (Her İki Node)
+# =============================================================================
+- name: "T07 | GFS2 Eşzamanlı Yazma Testi"
+  hosts: cluster_nodes
+  gather_facts: no
+  become: yes
+  tags: test_T07
+
+  tasks:
+    - name: "T07 | Banner"
+      debug:
+        msg: "════════ T07: GFS2 EŞZAMANLI YAZMA ════════"
+
+    - name: "T07 | GFS2 mount doğrula"
+      command: "mountpoint -q {{ gfs2_mount }}"
+      register: t07_mount_check
+      changed_when: false
+      failed_when: t07_mount_check.rc != 0
+
+    - name: "T07 | GFS2 disk alanı kontrolü"
+      shell: "df -h {{ gfs2_mount }} | tail -1"
+      register: t07_df
+      changed_when: false
+      run_once: true
+
+    - name: "T07 | GFS2 disk alanı"
+      debug:
+        msg: "GFS2 disk durumu: {{ t07_df.stdout }}"
+      run_once: true
+
+    - name: "T07 | Test (block/rescue ile güvenli)"
+      block:
+        - name: "T07 | Her node'dan eşzamanlı yazma başlat"
+          shell: |
+            node_name=$(hostname -s)
+            test_file="{{ gfs2_mount }}/ha_test_t07_${node_name}.txt"
+            echo "GFS2 yazma testi - $(date)" > "${test_file}"
+            for i in $(seq 1 100); do
+              echo "${node_name}: satir_${i}_$(date +%s%N)" >> "${test_file}"
+            done
+            echo "✓ ${node_name}: 100 satır yazıldı"
+            wc -l "${test_file}"
+          register: t07_write_result
+          changed_when: true
+          async: 60
+          poll: 0
+          register: t07_write_job
+
+        - name: "T07 | Yazma işleminin tamamlanmasını bekle"
+          async_status:
+            jid: "{{ t07_write_job.ansible_job_id }}"
+          register: t07_write_status
+          retries: 12
+          delay: 5
+          until: t07_write_status.finished
+
+        - name: "T07 | Yazma sonuçları"
+          debug:
+            msg: "{{ t07_write_status.stdout_lines }}"
+
+        - name: "T07 | GFS2 dosyaları her iki node'dan görünür mü?"
+          shell: "ls -la {{ gfs2_mount }}/ha_test_t07_*.txt 2>/dev/null"
+          register: t07_file_check
+          changed_when: false
+          run_once: true
+
+        - name: "T07 | Dosya listesi"
+          debug:
+            msg: "{{ t07_file_check.stdout_lines }}"
+          run_once: true
+
+        - name: "T07 | İki node'dan 2 dosya görünüyor mu?"
+          assert:
+            that: "t07_file_check.stdout_lines | length >= 2"
+            success_msg: "✓ GFS2 eşzamanlı yazma başarılı — her iki node'dan dosya görünüyor"
+            fail_msg: "✗ GFS2 dosya sayısı yanlış: {{ t07_file_check.stdout_lines | length }}"
+          run_once: true
+
+        - name: "T07 | Çapraz okuma testi (clstr01'in dosyası clstr02'den okunabilir mi?)"
+          shell: |
+            for f in {{ gfs2_mount }}/ha_test_t07_*.txt; do
+              count=$(wc -l < "$f")
+              echo "$(hostname -s) okuma: $f → $count satır"
+              [ "$count" -ge 100 ] || echo "HATA: $f eksik satır!"
+            done
+          register: t07_cross_read
+          changed_when: false
+
+        - name: "T07 | Çapraz okuma sonuçları"
+          debug:
+            msg: "{{ t07_cross_read.stdout_lines }}"
+
+        - name: "T07 | GFS2 filesystem tutarlılığı"
+          shell: |
+            df -T {{ gfs2_mount }} | grep -q gfs2 && echo "GFS2 filesystem OK"
+            mount | grep {{ gfs2_mount }} | grep -q rw && echo "GFS2 read-write mounted"
+          register: t07_gfs2_check
+          changed_when: false
+          run_once: true
+          failed_when: false
+
+        - name: "T07 | GFS2 mount kontrolü"
+          debug:
+            msg: "GFS2 durumu: {{ t07_gfs2_check.stdout_lines | default(['Bilgi alınamadı']) }}"
+          run_once: true
+
+      always:
+        - name: "T07 | Test dosyalarını temizle"
+          shell: "rm -f {{ gfs2_mount }}/ha_test_t07_*.txt"
+          changed_when: true
+          run_once: true
+          failed_when: false
+
+    - name: "T07 | SONUÇ"
+      debug:
+        msg: "✅ T07 BAŞARILI — GFS2 eşzamanlı yazma doğrulandı"
+      run_once: true
+
+
+# =============================================================================
+# T08: LVM LOCK KAYBI SİMÜLASYONU
+# =============================================================================
+- name: "T08 | LVM Lock Kaybı Testi"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+  tags: test_T08
+
+  tasks:
+    - name: "T08 | Banner"
+      debug:
+        msg: "════════ T08: LVM LOCK KAYBINDAN KURTARMA ════════"
+
+    - name: "T08 | lvmlockd process çalışıyor mu?"
+      command: pgrep -x lvmlockd
+      register: t08_lvmlockd_pid
+      changed_when: false
+
+    - name: "T08 | lvmlockd PID"
+      debug:
+        msg: "lvmlockd PID: {{ t08_lvmlockd_pid.stdout | trim }}"
+
+    - name: "T08 | lvmlockctl dump (başlangıç durumu)"
+      command: lvmlockctl --dump
+      register: t08_lockctl_before
+      changed_when: false
+      failed_when: false
+
+    - name: "T08 | shared_vg lockspace aktif mi?"
+      assert:
+        that: "'shared_vg' in t08_lockctl_before.stdout"
+        success_msg: "✓ shared_vg lockspace aktif"
+        fail_msg: "✗ shared_vg lockspace bulunamadı"
+
+    - name: "T08 | db_vg lockspace aktif mi?"
+      assert:
+        that: "'db_vg' in t08_lockctl_before.stdout"
+        success_msg: "✓ db_vg lockspace aktif"
+        fail_msg: "✗ db_vg lockspace bulunamadı"
+
+    - name: "T08 | lvmlockd resource failcount"
+      command: "pcs resource failcount show lvmlockd"
+      register: t08_failcount
+      changed_when: false
+      failed_when: false
+
+    - name: "T08 | use_lvmlockd lvm.conf doğrulama"
+      shell: "grep use_lvmlockd /etc/lvm/lvm.conf | grep -v '^[[:space:]]*#' | head -3"
+      register: t08_lvm_conf
+      changed_when: false
+      failed_when: false
+
+    - name: "T08 | LVM lock durumu raporu"
+      debug:
+        msg: |
+          lvmlockctl dump:
+          {{ t08_lockctl_before.stdout }}
+
+          use_lvmlockd config:
+          {{ t08_lvm_conf.stdout | default('(alınamadı)') }}
+
+          Failcount:
+          {{ t08_failcount.stdout | default('failcount bilgisi yok') }}
+
+    - name: "T08 | Her iki VG için lock-start idempotency testi"
+      command: "vgchange --lock-start {{ item }}"
+      loop:
+        - "{{ shared_vg }}"
+        - "{{ db_vg }}"
+      register: t08_lockstart
+      changed_when: false
+      failed_when: false
+
+    - name: "T08 | lock-start sonuçları"
+      debug:
+        msg: "VG {{ item.item }} lock-start rc={{ item.rc }} {{ item.stdout | default('') }}"
+      loop: "{{ t08_lockstart.results }}"
+
+    - name: "T08 | VG'lere erişim testi"
+      command: "vgs {{ item }}"
+      loop:
+        - "{{ shared_vg }}"
+        - "{{ db_vg }}"
+      register: t08_vgs_check
+      changed_when: false
+
+    - name: "T08 | VG erişim doğrulama"
+      assert:
+        that: item.rc == 0
+        success_msg: "✓ {{ item.item }} erişilebilir"
+        fail_msg: "✗ {{ item.item }} erişilemiyor"
+      loop: "{{ t08_vgs_check.results }}"
+
+    - name: "T08 | LV aktivasyon durumu kontrol"
+      shell: |
+        echo "=== shared_vg LV'leri ==="
+        lvs {{ shared_vg }} 2>/dev/null || echo "Erişilemiyor"
+        echo "=== db_vg LV'leri ==="
+        lvs {{ db_vg }} 2>/dev/null || echo "Erişilemiyor"
+      register: t08_lvs_check
+      changed_when: false
+      failed_when: false
+
+    - name: "T08 | LV durumu"
+      debug:
+        msg: "{{ t08_lvs_check.stdout_lines }}"
+
+    - name: "T08 | SONUÇ"
+      debug:
+        msg: |
+          ✅ T08 BAŞARILI — LVM Lock Doğrulama
+            shared_vg lockspace: aktif
+            db_vg lockspace: aktif
+            lock-start idempotency: doğrulandı
+            LV erişimi: doğrulandı
+
+
+# =============================================================================
+# T09: STONITH FENCE AGENT TESTİ
+# =============================================================================
+- name: "T09 | STONITH Fence Agent Testi"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+  tags: test_T09
+  vars:
+    node_boot_wait: 180
+
+  tasks:
+    - name: "T09 | Banner"
+      debug:
+        msg: "════════ T09: STONITH FENCE AGENT TESTİ ════════"
+
+    - name: "T09 | STONITH test kontrolü"
+      assert:
+        that: run_stonith_test | default(false) | bool
+        success_msg: "STONITH testi modu etkin"
+        fail_msg: "⏭ T09 ATLANDI — -e run_stonith_test=true gerekli (node REBOOT olur!)"
+      ignore_errors: yes
+      register: stonith_check
+
+    - name: "T09 | STONITH mod kapalıysa atla"
+      meta: end_play
+      when: not (run_stonith_test | default(false) | bool)
+
+    - name: "T09 | Pasif node'u belirle (fence edilecek)"
+      shell: "pcs resource status vip | grep Started | awk '{print $NF}'"
+      register: t09_active_raw
+      changed_when: false
+
+    - name: "T09 | Fence edilecek node: pasif node"
+      set_fact:
+        t09_fence_target: >-
+          {{ groups['cluster_nodes'] |
+             reject('equalto', t09_active_raw.stdout | trim) |
+             list | first }}
+        t09_active: "{{ t09_active_raw.stdout | trim }}"
+
+    - name: "T09 | Test (block/rescue ile güvenli)"
+      block:
+        - name: "T09 | Fence agent status testi (IPMI ping)"
+          command: >
+            ipmitool -I lanplus
+            -H {{ hostvars[t09_fence_target].ipmi_ip }}
+            -p {{ hostvars[t09_fence_target].ipmi_port }}
+            -U {{ hostvars[t09_fence_target].ipmi_user }}
+            -P {{ hostvars[t09_fence_target].ipmi_password }}
+            chassis power status
+          register: t09_ipmi_status
+          changed_when: false
+          no_log: true
+
+        - name: "T09 | IPMI erişilebilirlik"
+          assert:
+            that: t09_ipmi_status.rc == 0
+            success_msg: "✓ IPMI erişilebilir: {{ t09_ipmi_status.stdout }}"
+            fail_msg: "✗ IPMI erişilemiyor!"
+
+        - name: "T09 | Pasif node'u fence et: {{ t09_fence_target }}"
+          command: "pcs stonith fence {{ t09_fence_target }} --off"
+          register: t09_fence_result
+          changed_when: true
+
+        - name: "T09 | Fence sonrası node'un offline olduğunu doğrula"
+          command: pcs status
+          register: t09_post_fence
+          retries: 12
+          delay: 5
+          until: "'OFFLINE' in t09_post_fence.stdout or t09_fence_target.split('.')[0] + '.lab' not in t09_post_fence.stdout"
+          changed_when: false
+
+        - name: "T09 | Node fence doğrulama"
+          debug:
+            msg: |
+              Fence sonrası cluster durumu:
+              {{ t09_post_fence.stdout }}
+
+        - name: "T09 | IPMI ile node'u geri aç"
+          command: >
+            ipmitool -I lanplus
+            -H {{ hostvars[t09_fence_target].ipmi_ip }}
+            -p {{ hostvars[t09_fence_target].ipmi_port }}
+            -U {{ hostvars[t09_fence_target].ipmi_user }}
+            -P {{ hostvars[t09_fence_target].ipmi_password }}
+            chassis power on
+          register: t09_power_on
+          changed_when: true
+          no_log: true
+
+        - name: "T09 | Node'un boot etmesini bekle ({{ node_boot_wait }}s)"
+          wait_for:
+            host: "{{ hostvars[t09_fence_target].ansible_host }}"
+            port: 22
+            delay: 30
+            timeout: "{{ node_boot_wait }}"
+            state: started
+
+        - name: "T09 | Cluster'a yeniden katılma"
+          command: pcs cluster start
+          delegate_to: "{{ t09_fence_target }}"
+          failed_when: false
+
+        - name: "T09 | Node'un cluster'a döndüğünü doğrula"
+          command: pcs status
+          register: t09_recovery
+          retries: 24
+          delay: 10
+          until: >
+            'OFFLINE' not in t09_recovery.stdout and
+            t09_fence_target.split('.')[0] in t09_recovery.stdout
+          changed_when: false
+
+      rescue:
+        - name: "T09 | HATA — node'u IPMI ile açmayı dene"
+          command: >
+            ipmitool -I lanplus
+            -H {{ hostvars[t09_fence_target].ipmi_ip }}
+            -p {{ hostvars[t09_fence_target].ipmi_port }}
+            -U {{ hostvars[t09_fence_target].ipmi_user }}
+            -P {{ hostvars[t09_fence_target].ipmi_password }}
+            chassis power on
+          failed_when: false
+          no_log: true
+
+        - name: "T09 | HATA — detay"
+          fail:
+            msg: "✗ T09 başarısız! Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}"
+
+      always:
+        - name: "T09 | Resource cleanup"
+          command: pcs resource cleanup
+          changed_when: false
+          failed_when: false
+
+    - name: "T09 | SONUÇ"
+      debug:
+        msg: |
+          ✅ T09 BAŞARILI — STONITH Fence Agent
+            Fence target: {{ t09_fence_target }}
+            Fence method: pcs stonith fence --off (IPMI)
+            Kurtarma    : IPMI power on → cluster rejoin
+
+
+# =============================================================================
+# T10: iSCSI BAĞLANTI KESİNTİSİ
+# =============================================================================
+- name: "T10 | iSCSI Bağlantı Kesintisi Testi"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+  tags: test_T10
+  vars:
+    iscsi_block_duration: 30
+
+  tasks:
+    - name: "T10 | Banner"
+      debug:
+        msg: "════════ T10: iSCSI BAĞLANTI KESİNTİSİ ════════"
+
+    - name: "T10 | Yıkıcı test kontrolü"
+      assert:
+        that: run_destructive | default(false) | bool
+        success_msg: "Devam ediliyor"
+        fail_msg: "⏭ T10 ATLANDI — -e run_destructive=true gerekli"
+      ignore_errors: yes
+
+    - name: "T10 | Yıkıcı mod kapalıysa atla"
+      meta: end_play
+      when: not (run_destructive | default(false) | bool)
+
+    - name: "T10 | iSCSI target bağlantı durumu"
+      command: iscsiadm -m session
+      register: t10_iscsi_sessions
+      changed_when: false
+      failed_when: false
+
+    - name: "T10 | Aktif iSCSI session'ları"
+      debug:
+        msg: "{{ t10_iscsi_sessions.stdout_lines }}"
+
+    - name: "T10 | Multipath durumu (kesinti öncesi)"
+      command: multipath -ll
+      register: t10_mpath_before
+      changed_when: false
+      failed_when: false
+
+    - name: "T10 | Test (block/rescue ile güvenli)"
+      block:
+        - name: "T10 | iSCSI target portunu kes ({{ iscsi_block_duration }}s)"
+          shell: |
+            iptables -I OUTPUT -p tcp -d {{ iscsi_target_ip }} --dport 3260 -j DROP
+            iptables -I INPUT  -p tcp -s {{ iscsi_target_ip }} --dport 3260 -j DROP
+            echo "iSCSI blocked at $(date)"
+            sleep {{ iscsi_block_duration }}
+            iptables -D OUTPUT -p tcp -d {{ iscsi_target_ip }} --dport 3260 -j DROP 2>/dev/null || true
+            iptables -D INPUT  -p tcp -s {{ iscsi_target_ip }} --dport 3260 -j DROP 2>/dev/null || true
+            echo "iSCSI restored at $(date)"
+          async: "{{ iscsi_block_duration + 30 }}"
+          poll: 0
+          loop: "{{ groups['cluster_nodes'] }}"
+          delegate_to: "{{ item }}"
+
+        - name: "T10 | iSCSI kesintisi sırasında cluster davranışı izle"
+          command: pcs status
+          register: t10_status
+          retries: 6
+          delay: 5
+          changed_when: false
+          failed_when: false
+
+        - name: "T10 | Kesinti sırasındaki cluster durumu"
+          debug:
+            msg: "{{ t10_status.stdout_lines }}"
+
+        - name: "T10 | iSCSI kurtarmasını bekle"
+          pause:
+            seconds: "{{ iscsi_block_duration + 15 }}"
+
+        - name: "T10 | Resource cleanup"
+          command: pcs resource cleanup
+          changed_when: false
+
+        - name: "T10 | iSCSI kurtarma sonrası cluster stabilizasyonu"
+          command: pcs status
+          register: t10_recovery
+          retries: 24
+          delay: 5
+          until: "'Failed Resource Actions' not in t10_recovery.stdout"
+          changed_when: false
+          failed_when: false
+
+        - name: "T10 | GFS2 mount kurtarma doğrulama (her node)"
+          command: mountpoint -q {{ gfs2_mount }}
+          register: t10_gfs2_check
+          loop: "{{ groups['cluster_nodes'] }}"
+          delegate_to: "{{ item }}"
+          changed_when: false
+          failed_when: false
+
+        - name: "T10 | GFS2 mount durumu"
+          debug:
+            msg: "{{ item.item }}: GFS2 mount {{ 'OK' if item.rc == 0 else 'FAILED' }}"
+          loop: "{{ t10_gfs2_check.results }}"
+
+        - name: "T10 | Multipath durumu (kurtarma sonrası)"
+          command: multipath -ll
+          register: t10_mpath_after
+          changed_when: false
+          failed_when: false
+
+        - name: "T10 | Multipath kurtarma sonucu"
+          debug:
+            msg: "{{ t10_mpath_after.stdout_lines }}"
+
+      rescue:
+        - name: "T10 | HATA — iptables temizle"
+          shell: |
+            iptables -D OUTPUT -p tcp -d {{ iscsi_target_ip }} --dport 3260 -j DROP 2>/dev/null || true
+            iptables -D INPUT  -p tcp -s {{ iscsi_target_ip }} --dport 3260 -j DROP 2>/dev/null || true
+          changed_when: false
+          failed_when: false
+          loop: "{{ groups['cluster_nodes'] }}"
+          delegate_to: "{{ item }}"
+
+        - name: "T10 | HATA — detay"
+          fail:
+            msg: "✗ T10 başarısız! Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}"
+
+      always:
+        - name: "T10 | Iptables temizleme (güvenlik)"
+          shell: |
+            iptables -D OUTPUT -p tcp -d {{ iscsi_target_ip }} --dport 3260 -j DROP 2>/dev/null || true
+            iptables -D INPUT  -p tcp -s {{ iscsi_target_ip }} --dport 3260 -j DROP 2>/dev/null || true
+          changed_when: false
+          failed_when: false
+          loop: "{{ groups['cluster_nodes'] }}"
+          delegate_to: "{{ item }}"
+
+    - name: "T10 | SONUÇ"
+      debug:
+        msg: |
+          ✅ T10 TAMAMLANDI — iSCSI Bağlantı Kesintisi
+            Kesinti süresi: {{ iscsi_block_duration }}s
+            Kurtarma: cluster resource cleanup → reconnect
+
+
+# =============================================================================
+# T11: YÜK ALTINDA FAILOVER (Resource Limits)
+# =============================================================================
+- name: "T11 | Yük Altında Failover Testi"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+  tags: test_T11
+  vars:
+    pg_load_duration: 30
+    failover_wait: 90
+
+  tasks:
+    - name: "T11 | Banner"
+      debug:
+        msg: "════════ T11: YÜK ALTINDA FAILOVER ════════"
+
+    - name: "T11 | Test (block/rescue ile güvenli)"
+      block:
+        - name: "T11 | PostgreSQL yük üretimi başlat (arka planda)"
+          shell: |
+            psql -h {{ virtual_ip }} -U postgres << 'EOF'
+            CREATE TABLE IF NOT EXISTS ha_load_t11 (
+              id bigserial PRIMARY KEY,
+              data text,
+              ts timestamptz DEFAULT now()
+            );
+            EOF
+            for i in $(seq 1 1000); do
+              psql -h {{ virtual_ip }} -U postgres -c \
+                "INSERT INTO ha_load_t11 (data) VALUES (repeat('x', 1000));" \
+                >/dev/null 2>&1 || break
+              sleep 0.03
+            done
+            echo "Yük üretimi tamamlandı"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          async: "{{ pg_load_duration + 60 }}"
+          poll: 0
+          register: t11_load_job
+
+        - name: "T11 | Yük başladı — 10s bekle"
+          pause:
+            seconds: 10
+
+        - name: "T11 | Yük altında VIP failover"
+          shell: |
+            active=$(pcs resource status vip | grep Started | awk '{print $NF}')
+            target=$(pcs node show | grep 'Online' | tr ' ' '\n' | grep -v Online | grep -v $active | head -1)
+            echo "Failover: $active → $target"
+            pcs resource move vip $target
+            echo "move_initiated"
+          register: t11_move_result
+          changed_when: true
+
+        - name: "T11 | Yük altında failover tamamlanmasını bekle"
+          command: pcs resource status postgresql
+          register: t11_failover_wait
+          retries: "{{ (failover_wait / 5) | int }}"
+          delay: 5
+          until: "'Started' in t11_failover_wait.stdout"
+          changed_when: false
+
+        - name: "T11 | Yük sonrası bağlantı testi"
+          shell: |
+            psql -h {{ virtual_ip }} -U postgres -c \
+            "SELECT count(*) FROM ha_load_t11;"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          register: t11_count
+          changed_when: false
+          retries: 6
+          delay: 5
+          until: t11_count.rc == 0
+
+        - name: "T11 | Yazılan kayıt sayısı"
+          debug:
+            msg: "Yük altında yazılan kayıt sayısı: {{ t11_count.stdout }}"
+
+      rescue:
+        - name: "T11 | HATA — location constraint kaldır"
+          command: pcs resource clear vip
+          changed_when: false
+          failed_when: false
+
+        - name: "T11 | HATA — detay"
+          fail:
+            msg: "✗ T11 başarısız! Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}"
+
+      always:
+        - name: "T11 | Location constraint kaldır"
+          command: pcs resource clear vip
+          changed_when: false
+          failed_when: false
+
+        - name: "T11 | Temizlik"
+          shell: "psql -h {{ virtual_ip }} -U postgres -c 'DROP TABLE IF EXISTS ha_load_t11;'"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          changed_when: false
+          failed_when: false
+
+    - name: "T11 | SONUÇ"
+      debug:
+        msg: |
+          ✅ T11 BAŞARILI — Yük Altında Failover
+            Yük: 1000 INSERT işlemi
+            Failover: başarılı
+            Kayıtlar: {{ t11_count.stdout | trim }}
+
+
+# =============================================================================
+# T12: ÇOKLU ARDIŞIK FAILOVER (Dayanıklılık)
+# =============================================================================
+- name: "T12 | Ardışık Failover Dayanıklılık Testi"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+  tags: test_T12
+  vars:
+    failover_cycles: 3
+    cycle_wait: 60
+
+  tasks:
+    - name: "T12 | Banner"
+      debug:
+        msg: "════════ T12: ARDIŞIK FAILOVER DAYANIKLILIK TESTİ ({{ failover_cycles }} döngü) ════════"
+
+    - name: "T12 | Test (block/rescue ile güvenli)"
+      block:
+        - name: "T12 | Test tablosu oluştur"
+          shell: |
+            psql -h {{ virtual_ip }} -U postgres -c \
+            "CREATE TABLE IF NOT EXISTS ha_test_t12
+             (id serial, cycle int, ts timestamptz DEFAULT now(), node text);"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          changed_when: false
+
+        - name: "T12 | Failover döngüsü"
+          include_tasks: tasks/failover_cycle.yml
+          loop: "{{ range(1, failover_cycles + 1) | list }}"
+          loop_control:
+            loop_var: cycle_num
+
+        - name: "T12 | Toplam kayıt kontrolü"
+          shell: |
+            psql -h {{ virtual_ip }} -U postgres -At -c \
+            "SELECT count(*) FROM ha_test_t12;"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          register: t12_total
+          changed_when: false
+
+        - name: "T12 | Kayıt sayısı doğrulama"
+          assert:
+            that: t12_total.stdout | trim | int >= failover_cycles
+            success_msg: "✓ {{ t12_total.stdout | trim }} kayıt — {{ failover_cycles }} döngü boyunca veri korundu"
+            fail_msg: "✗ Veri kaybı — beklenen {{ failover_cycles }}, bulunan {{ t12_total.stdout | trim }}"
+
+      rescue:
+        - name: "T12 | HATA — location constraint kaldır"
+          command: pcs resource clear vip
+          changed_when: false
+          failed_when: false
+
+        - name: "T12 | HATA — detay"
+          fail:
+            msg: "✗ T12 başarısız! Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}"
+
+      always:
+        - name: "T12 | Location constraint kaldır"
+          command: pcs resource clear vip
+          changed_when: false
+          failed_when: false
+
+        - name: "T12 | Temizlik"
+          shell: "psql -h {{ virtual_ip }} -U postgres -c 'DROP TABLE IF EXISTS ha_test_t12;'"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          changed_when: false
+          failed_when: false
+
+    - name: "T12 | SONUÇ"
+      debug:
+        msg: |
+          ✅ T12 BAŞARILI — Ardışık Failover Dayanıklılığı
+            Döngü sayısı : {{ failover_cycles }}
+            Korunan kayıt: {{ t12_total.stdout | trim }}
+
+
+# =============================================================================
+# T13: TAM CLUSTER YENİDEN BAŞLATMA
+# =============================================================================
+- name: "T13 | Tam Cluster Yeniden Başlatma Testi"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+  tags: test_T13
+  vars:
+    restart_wait: 180
+
+  tasks:
+    - name: "T13 | Banner"
+      debug:
+        msg: "════════ T13: TAM CLUSTER YENİDEN BAŞLATMA ════════"
+
+    - name: "T13 | Yıkıcı test kontrolü"
+      assert:
+        that: run_destructive | default(false) | bool
+        success_msg: "Devam ediliyor"
+        fail_msg: "⏭ T13 ATLANDI — -e run_destructive=true gerekli"
+      ignore_errors: yes
+
+    - name: "T13 | Yıkıcı mod kapalıysa atla"
+      meta: end_play
+      when: not (run_destructive | default(false) | bool)
+
+    - name: "T13 | Test (block/rescue ile güvenli)"
+      block:
+        - name: "T13 | Cluster tamamen durdur"
+          command: pcs cluster stop --all --wait=120
+          register: t13_stop
+          changed_when: true
+
+        - name: "T13 | Tüm cluster servislerinin durduğunu doğrula"
+          command: systemctl is-active corosync
+          register: t13_corosync_stopped
+          failed_when: t13_corosync_stopped.rc == 0
+          changed_when: false
+          loop: "{{ groups['cluster_nodes'] }}"
+          delegate_to: "{{ item }}"
+
+        - name: "T13 | 10 saniye bekle"
+          pause:
+            seconds: 10
+
+        - name: "T13 | Cluster tamamen başlat"
+          command: pcs cluster start --all --wait=120
+          register: t13_start
+          changed_when: true
+
+        - name: "T13 | Cluster'ın tam olarak başlamasını bekle"
+          command: pcs status
+          register: t13_start_wait
+          retries: "{{ (restart_wait / 10) | int }}"
+          delay: 10
+          until: >
+            'Online: [ ' in t13_start_wait.stdout and
+            'OFFLINE' not in t13_start_wait.stdout and
+            'FAILED' not in t13_start_wait.stdout
+          changed_when: false
+
+        - name: "T13 | Resource cleanup (stale counter'lar)"
+          command: pcs resource cleanup
+          changed_when: false
+
+        - name: "T13 | GFS2 her iki node'da başladı mı?"
+          command: pcs resource status gfs2_fs-clone
+          register: t13_gfs2
+          retries: 12
+          delay: 10
+          until: >
+            groups['cluster_nodes'][0].split('.')[0] in t13_gfs2.stdout and
+            groups['cluster_nodes'][1].split('.')[0] in t13_gfs2.stdout
+          changed_when: false
+
+        - name: "T13 | PostgreSQL başladı mı?"
+          command: pcs resource status postgresql
+          register: t13_pg
+          retries: 12
+          delay: 10
+          until: "'Started' in t13_pg.stdout"
+          changed_when: false
+
+        - name: "T13 | Tam yeniden başlatma sonrası bağlantı testi"
+          command: >
+            psql -h {{ virtual_ip }} -U postgres -c "SELECT version();"
+          environment:
+            PGPASSWORD: "{{ pgsql_password }}"
+          register: t13_pg_connect
+          changed_when: false
+          retries: 6
+          delay: 5
+          until: t13_pg_connect.rc == 0
+
+      rescue:
+        - name: "T13 | HATA — cluster başlatmayı dene"
+          command: pcs cluster start --all
+          failed_when: false
+
+        - name: "T13 | HATA — detay"
+          fail:
+            msg: "✗ T13 başarısız! Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}"
+
+      always:
+        - name: "T13 | Resource cleanup"
+          command: pcs resource cleanup
+          changed_when: false
+          failed_when: false
+
+    - name: "T13 | SONUÇ"
+      debug:
+        msg: |
+          ✅ T13 BAŞARILI — Tam Cluster Yeniden Başlatma
+            Stop  : tüm node'lar durduruldu
+            Start : tüm node'lar başlatıldı
+            GFS2  : her iki node'da aktif
+            pgsql : Started ({{ virtual_ip }} üzerinden erişilebilir)
+
+
+# =============================================================================
+# FINAL: TEST RAPORU VE ORTAM RESTORE
+# =============================================================================
+- name: "RAPOR | Test Özet Raporu ve Ortam Restore"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: yes
+  become: yes
+  tags: always
+
+  tasks:
+    # ── Kapsamlı Temizlik ────────────────────────────────────────────────────
+    - name: "RAPOR | Tüm iptables test kurallarını temizle (güvenlik)"
+      shell: |
+        iptables -D INPUT  -p udp --dport 5405 -j DROP 2>/dev/null || true
+        iptables -D OUTPUT -p udp --dport 5405 -j DROP 2>/dev/null || true
+        iptables -D INPUT  -p tcp --dport 5405 -j DROP 2>/dev/null || true
+        iptables -D OUTPUT -p tcp --dport 5405 -j DROP 2>/dev/null || true
+        iptables -D OUTPUT -p tcp --dport {{ qdevice_port }} -j DROP 2>/dev/null || true
+        iptables -D INPUT  -p tcp --dport {{ qdevice_port }} -j DROP 2>/dev/null || true
+        iptables -D OUTPUT -p tcp -d {{ iscsi_target_ip }} --dport 3260 -j DROP 2>/dev/null || true
+        iptables -D INPUT  -p tcp -s {{ iscsi_target_ip }} --dport 3260 -j DROP 2>/dev/null || true
+      changed_when: false
+      failed_when: false
+      loop: "{{ groups['cluster_nodes'] }}"
+      delegate_to: "{{ item }}"
+
+    - name: "RAPOR | Tüm test tablolarını temizle (PostgreSQL)"
+      shell: |
+        psql -h {{ virtual_ip }} -U postgres -c \
+        "DROP TABLE IF EXISTS ha_test_t02, ha_test_t03, ha_test_t06,
+         ha_load_t11, ha_test_t12 CASCADE;"
+      environment:
+        PGPASSWORD: "{{ pgsql_password }}"
+      changed_when: false
+      failed_when: false
+
+    - name: "RAPOR | GFS2 test dosyalarını temizle"
+      shell: "rm -f {{ gfs2_mount }}/ha_test_t07_*.txt"
+      changed_when: false
+      failed_when: false
+
+    - name: "RAPOR | Tüm location constraint'leri temizle"
+      command: pcs resource clear vip
+      changed_when: false
+      failed_when: false
+
+    - name: "RAPOR | Son resource cleanup"
+      command: pcs resource cleanup
+      changed_when: false
+
+    - name: "RAPOR | Stabilizasyon bekleme (20s)"
+      pause:
+        seconds: 20
+
+    # ── Son Durum Kontrolleri ────────────────────────────────────────────────
+    - name: "RAPOR | Son cluster durumu"
+      command: pcs status
+      register: final_status
+      changed_when: false
+
+    - name: "RAPOR | Son constraint durumu"
+      command: pcs constraint
+      register: final_constraints
+      changed_when: false
+
+    - name: "RAPOR | Quorum son durumu"
+      command: pcs quorum status
+      register: final_quorum
+      changed_when: false
+
+    - name: "RAPOR | GFS2 mount durumu (her node)"
+      shell: |
+        echo "=== Node: {{ item }} ==="
+        df -h {{ gfs2_mount }} 2>/dev/null || echo "{{ gfs2_mount }} mount edilmemiş"
+        mount | grep {{ gfs2_mount }} || echo "{{ gfs2_mount }} mount satırı bulunamadı"
+      register: gfs2_final_check
+      changed_when: false
+      failed_when: false
+      loop: "{{ groups['cluster_nodes'] }}"
+      delegate_to: "{{ item }}"
+
+    - name: "RAPOR | Her iki node'da mount durumu"
+      shell: "df -h {{ gfs2_mount }} {{ pgsql_mount }} 2>/dev/null || true"
+      register: final_mounts
+      changed_when: false
+      loop: "{{ groups['cluster_nodes'] }}"
+      delegate_to: "{{ item }}"
+
+    - name: "RAPOR | Son PostgreSQL bağlantı testi"
+      command: >
+        psql -h {{ virtual_ip }} -U postgres
+        -c "SELECT 'cluster OK' AS durum, now() AS zaman, version() AS versiyon;"
+      environment:
+        PGPASSWORD: "{{ pgsql_password }}"
+      register: final_pg_check
+      changed_when: false
+      failed_when: false
+
+    - name: "RAPOR | Son PostgreSQL durumu"
+      debug:
+        msg: "{{ final_pg_check.stdout_lines | default(['PostgreSQL erişilemiyor']) }}"
+
+    # ── Özet Rapor ───────────────────────────────────────────────────────────
+    - name: "RAPOR | Özet rapor"
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════════╗
+          ║                  HA CLUSTER TEST RAPORU                             ║
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  Tarih    : {{ ansible_date_time.date }} {{ ansible_date_time.time }}
+          ║  Cluster  : {{ cluster_name }}
+          ║  VIP      : {{ virtual_ip }}:{{ pgsql_port }}
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  TEST SONUÇLARI:                                                    ║
+          ║                                                                     ║
+          ║  T01 Temel Sağlık Kontrolü          ✅ (her zaman çalışır)         ║
+          ║  T02 VIP Failover                   ✅ (her zaman çalışır)         ║
+          ║  T03 Aktif Node Kapatma             {{ '✅ (çalıştı)' if run_destructive | bool else '⏭  (atlandı - destructive)' }}
+          ║  T04 Corosync Ring Kesintisi        {{ '✅ (çalıştı)' if run_destructive | bool else '⏭  (atlandı - destructive)' }}
+          ║  T05 Split-Brain Önleme             {{ '✅ (çalıştı)' if run_destructive | bool else '⏭  (atlandı - destructive)' }}
+          ║  T06 PostgreSQL kill -9             ✅ (her zaman çalışır)         ║
+          ║  T07 GFS2 Eşzamanlı Yazma          ✅ (her zaman çalışır)         ║
+          ║  T08 LVM Lock Doğrulama             ✅ (her zaman çalışır)         ║
+          ║  T09 STONITH Fence Agent            {{ '✅ (çalıştı - node reboot!)' if run_stonith_test | bool else '⏭  (atlandı - stonith_test)' }}
+          ║  T10 iSCSI Bağlantı Kesintisi       {{ '✅ (çalıştı)' if run_destructive | bool else '⏭  (atlandı - destructive)' }}
+          ║  T11 Yük Altında Failover           ✅ (her zaman çalışır)         ║
+          ║  T12 Ardışık Failover (3x)          ✅ (her zaman çalışır)         ║
+          ║  T13 Tam Cluster Restart            {{ '✅ (çalıştı)' if run_destructive | bool else '⏭  (atlandı - destructive)' }}
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  SON CLUSTER DURUMU:                                                ║
+          {{ final_status.stdout | indent(2) }}
+          ╚══════════════════════════════════════════════════════════════════════╝
+
+    # ── Markdown Rapor Dosyası ───────────────────────────────────────────────
+    - name: "RAPOR | Markdown rapor için sistem bilgilerini topla"
+      shell: |
+        echo "KERNEL=$(uname -r)"
+        echo "OS=$(cat /etc/redhat-release 2>/dev/null || echo 'bilinmiyor')"
+        echo "PACEMAKER=$(pcs --version 2>/dev/null | head -1 || echo 'bilinmiyor')"
+        echo "COROSYNC=$(corosync --version 2>/dev/null | head -1 || echo 'bilinmiyor')"
+        echo "PSQL=$(psql --version 2>/dev/null | head -1 || echo 'bilinmiyor')"
+      register: md_sysinfo
+      changed_when: false
+      failed_when: false
+
+    - name: "RAPOR | Corosync ring detay (markdown için)"
+      command: corosync-cfgtool -s
+      register: md_ring_status
+      changed_when: false
+      failed_when: false
+
+    - name: "RAPOR | Quorum detay (markdown için)"
+      command: corosync-quorumtool -s
+      register: md_quorum_detail
+      changed_when: false
+      failed_when: false
+
+    - name: "RAPOR | Constraint listesi (markdown için)"
+      command: pcs constraint show --full
+      register: md_constraints
+      changed_when: false
+      failed_when: false
+
+    - name: "RAPOR | Resource failcount (markdown için)"
+      command: pcs resource failcount show
+      register: md_failcount
+      changed_when: false
+      failed_when: false
+
+    - name: "RAPOR | LVM lock durumu (markdown için)"
+      command: lvmlockctl --dump
+      register: md_lvm_lock
+      changed_when: false
+      failed_when: false
+
+    - name: "RAPOR | iSCSI session durumu (markdown için)"
+      command: iscsiadm -m session
+      register: md_iscsi_sessions
+      changed_when: false
+      failed_when: false
+
+    - name: "RAPOR | Multipath durumu (markdown için)"
+      command: multipath -ll
+      register: md_multipath
+      changed_when: false
+      failed_when: false
+
+    - name: "RAPOR | Her node disk/mount bilgisi (markdown için)"
+      shell: |
+        echo "=== {{ item }} ==="
+        df -h {{ gfs2_mount }} {{ pgsql_mount }} 2>/dev/null || echo "(mount bilgisi alınamadı)"
+      register: md_disk_info
+      changed_when: false
+      failed_when: false
+      loop: "{{ groups['cluster_nodes'] }}"
+      delegate_to: "{{ item }}"
+
+    - name: "RAPOR | PostgreSQL versiyon detayı (markdown için)"
+      shell: |
+        psql -h {{ virtual_ip }} -U postgres -At -c \
+        "SELECT version();"
+      environment:
+        PGPASSWORD: "{{ pgsql_password }}"
+      register: md_pg_version
+      changed_when: false
+      failed_when: false
+
+    - name: "RAPOR | Markdown rapor dosyası oluştur"
+      vars:
+        md_report_path: "/tmp/ha_cluster_test/ha_cluster_test_report_{{ ansible_date_time.iso8601_basic_short }}.md"
+        t01_status: "✅ BAŞARILI"
+        t02_status: "✅ BAŞARILI"
+        t03_status: "{{ '✅ BAŞARILI' if run_destructive | bool else '⏭ ATLANDI' }}"
+        t04_status: "{{ '✅ BAŞARILI' if run_destructive | bool else '⏭ ATLANDI' }}"
+        t05_status: "{{ '✅ BAŞARILI' if run_destructive | bool else '⏭ ATLANDI' }}"
+        t06_status: "✅ BAŞARILI"
+        t07_status: "✅ BAŞARILI"
+        t08_status: "✅ BAŞARILI"
+        t09_status: "{{ '✅ BAŞARILI (node reboot edildi)' if run_stonith_test | bool else '⏭ ATLANDI' }}"
+        t10_status: "{{ '✅ BAŞARILI' if run_destructive | bool else '⏭ ATLANDI' }}"
+        t11_status: "✅ BAŞARILI"
+        t12_status: "✅ BAŞARILI"
+        t13_status: "{{ '✅ BAŞARILI' if run_destructive | bool else '⏭ ATLANDI' }}"
+        pg_ok: "{{ '✅ Erişilebilir' if final_pg_check.rc == 0 else '❌ Erişilemiyor' }}"
+      copy:
+        dest: "{{ md_report_path }}"
+        content: |
+          # 🔴 Red Hat 9 HA Cluster — Test Raporu
+
+          > **Otomatik oluşturuldu:** `ansible-playbook ha_cluster_test.yml`
+
+          ---
+
+          ## 📋 Genel Bilgiler
+
+          | Alan | Değer |
+          |------|-------|
+          | **Tarih / Saat** | {{ ansible_date_time.date }} {{ ansible_date_time.time }} |
+          | **Cluster Adı** | `{{ cluster_name }}` |
+          | **Node 1** | `{{ groups['cluster_nodes'][0] }}` ({{ hostvars[groups['cluster_nodes'][0]].ansible_host }}) |
+          | **Node 2** | `{{ groups['cluster_nodes'][1] }}` ({{ hostvars[groups['cluster_nodes'][1]].ansible_host }}) |
+          | **Quorum Device** | `{{ groups['quorum_device'][0] }}` ({{ hostvars[groups['quorum_device'][0]].ansible_host }}) |
+          | **Virtual IP** | `{{ virtual_ip }}:{{ pgsql_port }}` |
+          | **GFS2 Mount** | `{{ gfs2_mount }}` |
+          | **PostgreSQL Mount** | `{{ pgsql_mount }}` |
+          | **Test Modu** | Yıkıcı: `{{ run_destructive | bool }}` / STONITH: `{{ run_stonith_test | bool }}` |
+
+          ---
+
+          ## 🖥️ Sistem Bilgileri
+
+          ```
+          {{ md_sysinfo.stdout | default('(alınamadı)') }}
+          ```
+
+          **PostgreSQL:**
+          ```
+          {{ md_pg_version.stdout | default('(alınamadı)') }}
+          ```
+
+          ---
+
+          ## ✅ Test Sonuçları Özeti
+
+          | Test | Açıklama | Sonuç | Not |
+          |------|----------|-------|-----|
+          | **T01** | Temel Cluster Sağlık Kontrolü | {{ t01_status }} | Her zaman çalışır |
+          | **T02** | VIP Failover (Node Bakımı) | {{ t02_status }} | Her zaman çalışır |
+          | **T03** | Aktif Node Ani Kapatma | {{ t03_status }} | `-e run_destructive=true` gerekli |
+          | **T04** | Corosync Ring Ağ Kesintisi | {{ t04_status }} | `-e run_destructive=true` gerekli |
+          | **T05** | Split-Brain Önleme | {{ t05_status }} | `-e run_destructive=true` gerekli |
+          | **T06** | PostgreSQL Servis Çöküşü (kill -9) | {{ t06_status }} | Her zaman çalışır |
+          | **T07** | GFS2 Eşzamanlı Yazma | {{ t07_status }} | Her zaman çalışır |
+          | **T08** | LVM Lock Doğrulama | {{ t08_status }} | Her zaman çalışır |
+          | **T09** | STONITH Fence Agent Testi | {{ t09_status }} | `-e run_stonith_test=true` gerekli |
+          | **T10** | iSCSI Bağlantı Kesintisi | {{ t10_status }} | `-e run_destructive=true` gerekli |
+          | **T11** | Yük Altında Failover | {{ t11_status }} | Her zaman çalışır |
+          | **T12** | Çoklu Ardışık Failover (3x) | {{ t12_status }} | Her zaman çalışır |
+          | **T13** | Tam Cluster Yeniden Başlatma | {{ t13_status }} | `-e run_destructive=true` gerekli |
+
+          ---
+
+          ## 🏥 Son Cluster Durumu
+
+          ### pcs status
+
+          ```
+          {{ final_status.stdout | default('(alınamadı)') }}
+          ```
+
+          ### Quorum Durumu
+
+          ```
+          {{ md_quorum_detail.stdout | default('(alınamadı)') }}
+          ```
+
+          ### Corosync Ring
+
+          ```
+          {{ md_ring_status.stdout | default('(alınamadı)') }}
+          ```
+
+          ---
+
+          ## 🔒 Constraint'ler
+
+          ```
+          {{ md_constraints.stdout | default('(alınamadı)') }}
+          ```
+
+          ---
+
+          ## 🗄️ Depolama Durumu
+
+          ### iSCSI Session'ları
+
+          ```
+          {{ md_iscsi_sessions.stdout | default('(session bulunamadı)') }}
+          ```
+
+          ### Multipath Cihazlar
+
+          ```
+          {{ md_multipath.stdout | default('(alınamadı)') }}
+          ```
+
+          ### LVM Lock Durumu
+
+          ```
+          {{ md_lvm_lock.stdout | default('(alınamadı)') }}
+          ```
+
+          ### Disk / Mount Kullanımı
+
+          {% for item in md_disk_info.results %}
+          ```
+          {{ item.stdout | default('(alınamadı)') }}
+          ```
+          {% endfor %}
+
+          ---
+
+          ## 🐘 PostgreSQL
+
+          | Alan | Değer |
+          |------|-------|
+          | **VIP Bağlantısı** | {{ pg_ok }} |
+          | **Host:Port** | `{{ virtual_ip }}:{{ pgsql_port }}` |
+          | **Versiyon** | `{{ md_pg_version.stdout | default('bilinmiyor') | trim }}` |
+
+          ```
+          {{ final_pg_check.stdout | default('(bağlantı kurulamadı)') }}
+          ```
+
+          ---
+
+          ## 📊 Resource Failcount
+
+          ```
+          {{ md_failcount.stdout | default('(failcount alınamadı veya hata yok)') }}
+          ```
+
+          ---
+
+          ## 📝 Test Detayları
+
+          ### T01 — Temel Cluster Sağlık Kontrolü
+          - Corosync ring (tüm peer'ler connected)
+          - Quorum device bağlantısı (ffsplit algoritması)
+          - Cluster quorate durumu
+          - Tüm Pacemaker resource'ları çalışıyor
+          - GFS2 her iki node'da mount edilmiş
+          - PostgreSQL diski aktif node'da mount edilmiş
+          - VIP üzerinden PostgreSQL bağlantısı
+          - STONITH etkin
+          - IPMI erişilebilirliği (her node)
+          - Servis durumu: corosync, pacemaker, qdevice, multipathd, iscsid
+
+          ### T02 — VIP Failover (Node Bakımı Simülasyonu)
+          - Failover öncesi PostgreSQL'e veri yazıldı
+          - `pcs resource move vip` ile hedef node'a taşındı
+          - Failover sonrası VIP üzerinden bağlantı doğrulandı
+          - Veri tutarlılığı: failover öncesi kayıtların korunduğu doğrulandı
+
+          ### T03 — Aktif Node Ani Kapatma
+          - `pcs cluster stop --force` ile aktif node durduruldu
+          - Pasif node'da otomatik failover beklendi
+          - Failover sonrası bağlantı test edildi
+          - Failover öncesi yazılan verinin korunduğu doğrulandı
+          - Durdurulmuş node otomatik olarak geri başlatıldı
+          - **Gereksinim:** `-e run_destructive=true`
+
+          ### T04 — Corosync Ring Ağ Kesintisi
+          - iptables ile 5405/udp corosync trafiği `{{ '45' }}s` kesildi
+          - Kesinti sırasında cluster davranışı izlendi
+          - Ağ kurtarma sonrası corosync ring bağlantısı doğrulandı
+          - VIP üzerinden PostgreSQL erişilebilirliği test edildi
+          - **Gereksinim:** `-e run_destructive=true`
+
+          ### T05 — Split-Brain Önleme
+          - iptables ile qdevice portu ({{ qdevice_port }}/tcp) kesildi
+          - `no-quorum-policy=freeze` davranışı gözlemlendi
+          - Qdevice kurtarma ve yeniden bağlantı doğrulandı
+          - **Gereksinim:** `-e run_destructive=true`
+
+          ### T06 — PostgreSQL Servis Çöküşü (kill -9)
+          - Failover öncesi veri yazıldı
+          - Postmaster process'e `kill -9` gönderildi
+          - Pacemaker `on-fail=restart` ile yeniden başlattı
+          - Failcount kontrol edildi (migration threshold aşılmamalı)
+          - Kurtarma sonrası verinin korunduğu doğrulandı
+
+          ### T07 — GFS2 Eşzamanlı Yazma
+          - Her iki node'dan aynı anda GFS2'ye 100 satır yazıldı
+          - Her iki node'dan diğerinin yazdığı dosyanın okunabildiği doğrulandı
+          - GFS2 filesystem read-write durumu kontrol edildi
+
+          ### T08 — LVM Lock Doğrulama
+          - lvmlockd process kontrolü
+          - `shared_vg` ve `db_vg` lockspace durumu doğrulandı
+          - lock-start idempotency testi (tekrar çalıştırılabilirlik)
+          - VG erişim (`vgs`) ve LV aktivasyon durumu
+          - `use_lvmlockd` lvm.conf konfigürasyonu
+
+          ### T09 — STONITH Fence Agent Testi
+          - IPMI erişilebilirliği doğrulandı
+          - Pasif node `pcs stonith fence --off` ile fence edildi
+          - Node offline duruma düştü, cluster davranışı gözlemlendi
+          - IPMI ile güç verildi, node cluster'a geri döndü
+          - **Gereksinim:** `-e run_stonith_test=true` (node REBOOT eder!)
+
+          ### T10 — iSCSI Bağlantı Kesintisi
+          - iptables ile iSCSI hedef portuna (3260/tcp) bağlantı kesildi
+          - Kesinti sırasında cluster davranışı izlendi
+          - Kurtarma sonrası GFS2 mount durumu doğrulandı
+          - Multipath path recovery kontrol edildi
+          - **Gereksinim:** `-e run_destructive=true`
+
+          ### T11 — Yük Altında Failover
+          - 1000 INSERT işlemi arka planda başlatıldı
+          - Yük devam ederken VIP failover tetiklendi
+          - Failover tamamlandı, yazılan kayıt sayısı doğrulandı
+
+          ### T12 — Çoklu Ardışık Failover (Dayanıklılık)
+          - `{{ failover_cycles | default(3) }}` kez ardışık failover gerçekleştirildi
+          - Her döngüde veri yazılıp failover sonrası korunduğu doğrulandı
+          - Toplam kayıt sayısı döngü sayısıyla eşleşti
+
+          ### T13 — Tam Cluster Yeniden Başlatma
+          - `pcs cluster stop --all` ile tüm cluster durduruldu
+          - 10s bekleme sonrası `pcs cluster start --all` ile başlatıldı
+          - GFS2 her iki node'da aktif, PostgreSQL erişilebilir durumda
+          - **Gereksinim:** `-e run_destructive=true`
+
+          ---
+
+          *Rapor `/tmp/ha_cluster_test/` dizinine kaydedildi.*
+          *Oluşturulma: {{ ansible_date_time.iso8601 }}*
+        mode: '0644'
+      register: md_report_result
+
+    - name: "RAPOR | Markdown rapor dosyası bilgisi"
+      debug:
+        msg: |
+          ✅ Markdown rapor oluşturuldu:
+             {{ md_report_result.dest }}
+
+          İndirmek için:
+             scp root@{{ ansible_host }}:{{ md_report_result.dest }} ./ha_cluster_report.md

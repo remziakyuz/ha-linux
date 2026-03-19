@@ -1,0 +1,3581 @@
+---
+# =============================================================================
+# RED HAT 9 HIGH AVAILABILITY CLUSTER - ANA PLAYBOOK
+# =============================================================================
+# Mimari:
+#   - 2 Cluster Node (clstr01, clstr02) - Aktif/Pasif PostgreSQL
+#   - 1 Quorum Device (clstr-qrm01)     - Küme arbitratörü
+#   - 1 iSCSI LUN → LVM → GFS2 + pgsql
+#   - GFS2: /shared/webfs (Aktif/Aktif - her iki node)
+#   - PostgreSQL: /var/lib/pgsql (Aktif/Pasif - sadece aktif node)
+#   - STONITH: fence_ipmilan (IPMI/iDRAC/iLO)
+#   - Quorum: corosync-qnetd
+#
+# KULLANIM:
+#   Normal    : ansible-playbook ha_cluster_setup.yml
+#   Sıfırlama : ansible-playbook ha_cluster_setup.yml -e force_reinstall=true
+#
+# SURUM: 0.1
+# =============================================================================
+
+# =============================================================================
+# PLAY 1: ÖNKOŞUL KONTROLÜ VE HAZIRLIK
+# =============================================================================
+- name: "PLAY 1/13 | Önkoşul Kontrolü ve Hazırlık"
+  hosts: all
+  gather_facts: yes
+  become: yes
+  any_errors_fatal: true
+
+  tasks:
+    - name: "BANNER | Kurulum başlıyor"
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════╗
+          ║   RED HAT 9 HIGH AVAILABILITY CLUSTER KURULUMU                  ║
+          ║   Node : {{ inventory_hostname }} ({{ ansible_host }})          ║
+          ║   Tarih: {{ ansible_date_time.iso8601 }}                        ║
+          ╠══════════════════════════════════════════════════════════════════╣
+          ║   MOD: {{ force_reinstall | default(false) | bool |
+                ternary("⚠  ZORLA YENİDEN KURULUM (force_reinstall=true)",
+                        "✓  IDEMPOTENT - mevcut yapılandırma korunur") }}
+          ║   Yeniden kurulum: -e force_reinstall=true                      ║
+          ╚══════════════════════════════════════════════════════════════════╝
+
+    # ---- OS Kontrolü -------------------------------------------------------
+    - name: "CHECK | RHEL 9 doğrulanıyor"
+      block:
+        - name: OS versiyonu kontrol
+          assert:
+            that:
+              - ansible_distribution == "RedHat"
+              - ansible_distribution_major_version == "9"
+            success_msg: "✓ RHEL 9 doğrulandı ({{ ansible_distribution }} {{ ansible_distribution_version }})"
+            fail_msg: "✗ HATA: Bu playbook RHEL 9 gerektirir. Bulunan: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+      rescue:
+        - name: OS hatası - detay
+          debug:
+            msg: |
+              ✗ HATA: Yanlış işletim sistemi!
+              Beklenen : Red Hat Enterprise Linux 9.x
+              Bulunan  : {{ ansible_distribution }} {{ ansible_distribution_version }}
+              ÇÖZÜM    : Bu playbook'u sadece RHEL 9 sistemlerde çalıştırın.
+        - name: Kurulumu durdur
+          fail:
+            msg: "Kurulum durduruldu: Yanlış OS versiyonu"
+
+    # ---- Kaynak Kontrolleri ------------------------------------------------
+    - name: "CHECK | Minimum RAM (2GB)"
+      assert:
+        that: ansible_memtotal_mb >= 2048
+        success_msg: "✓ RAM yeterli: {{ ansible_memtotal_mb }}MB"
+        fail_msg: "✗ HATA: Minimum 2GB RAM gerekli. Mevcut: {{ ansible_memtotal_mb }}MB"
+
+    - name: "CHECK | Minimum disk alanı (20GB /)"
+      assert:
+        that: (ansible_mounts | selectattr('mount', 'equalto', '/') | first).size_available > 21474836480
+        success_msg: "✓ / bölümünde yeterli alan mevcut"
+        fail_msg: "✗ HATA: / bölümünde minimum 20GB boş alan gerekli"
+
+    - name: "CHECK | SELinux durumu"
+      command: getenforce
+      register: selinux_status
+      changed_when: false
+
+    - name: "INFO | SELinux durumu"
+      debug:
+        msg: "ℹ SELinux: {{ selinux_status.stdout }} (Enforcing önerilir)"
+
+    # ---- Hostname ----------------------------------------------------------
+    - name: "SETUP | Hostname ayarlanıyor"
+      hostname:
+        name: "{{ inventory_hostname }}"
+        use: systemd
+
+    # FIX 1a: /etc/hosts - Loopback çakışmasını temizle
+    # SORUN (logdan): clstr01 kendi adını ::1'e resolve ediyordu çünkü default
+    # /etc/hosts'ta "::1 hostname localhost" satırı bulunuyor. Bu pcs auth,
+    # corosync ve cluster iletişimini bozar.
+    # ÇÖZÜM: Her node'un kısa ve tam adını ::1 / 127.x satırlarından sil.
+    - name: "SETUP | /etc/hosts - Loopback çakışmasını temizle"
+      shell: |
+        {% for host in groups['cluster_nodes'] + groups['quorum_device'] %}
+        SHORT="{{ host.split('.')[0] }}"
+        FQDN="{{ host }}"
+        sed -i "/^::1[[:space:]]/ s/\b${SHORT}\b//g; /^::1[[:space:]]/ s/\b${FQDN}\b//g" /etc/hosts
+        sed -i "/^127\.[0-9]*\.[0-9]*\.[0-9]*[[:space:]]/ s/\b${SHORT}\b//g; /^127\.[0-9]*\.[0-9]*\.[0-9]*[[:space:]]/ s/\b${FQDN}\b//g" /etc/hosts
+        {% endfor %}
+        # Boş kalan loopback satırlarını derle (sadece "::1" veya "127.x.x.x" kalan satırlar)
+        sed -i '/^::1[[:space:]]*$/d' /etc/hosts
+        sed -i '/^127\.[0-9]*\.[0-9]*\.[0-9]*[[:space:]]*$/d' /etc/hosts
+      changed_when: false
+      failed_when: false
+
+    # FIX 1b: /etc/hosts - Cluster node girişleri
+    # SORUN (logdan): "{{ host }}.{{ cluster_domain }}" double-domain üretiyordu
+    # çünkü host zaten FQDN (clstr01.lab.akyuz.tech) → "clstr01.lab.akyuz.tech.lab.akyuz.tech"
+    # ÇÖZÜM: Kısa ad (split('.')[0]) + FQDN olarak yaz, .cluster_domain ekleme.
+    - name: "SETUP | /etc/hosts - Cluster node'ları (public network)"
+      blockinfile:
+        path: /etc/hosts
+        block: |
+          {% for host in groups['cluster_nodes'] %}
+          {{ hostvars[host].ansible_host }} {{ host.split('.')[0] }} {{ host }}
+          {{ hostvars[host].cluster_ip }} {{ host.split('.')[0] }}-cluster
+          {% endfor %}
+          {% for host in groups['quorum_device'] %}
+          {{ hostvars[host].ansible_host }} {{ host.split('.')[0] }} {{ host }}
+          {% endfor %}
+        marker: "# {mark} ANSIBLE MANAGED CLUSTER HOSTS"
+        backup: yes
+
+    - name: "CHECK | Hostname çözümleme testi"
+      command: "getent hosts {{ item }}"
+      loop: "{{ groups['all'] }}"
+      changed_when: false
+      register: hostname_check
+
+    - name: "RESULT | Hostname çözümleme sonuçları"
+      debug:
+        msg: "✓ {{ item.item }}: {{ item.stdout }}"
+      loop: "{{ hostname_check.results }}"
+      when: item.rc == 0
+
+    - name: "WARN | Çözümlenemeyen hostlar"
+      debug:
+        msg: |
+          ⚠ UYARI: {{ item.item }} çözümlenemedi!
+          ÇÖZÜM: /etc/hosts veya DNS yapılandırmasını kontrol edin.
+      loop: "{{ hostname_check.results }}"
+      when: item.rc != 0
+
+
+# =============================================================================
+# PLAY 1b: IPMI BAĞLANTI KONTROLÜ
+# =============================================================================
+- name: "PLAY 1b/13 | IPMI Bağlantı ve Erişim Kontrolü"
+  hosts: cluster_nodes
+  gather_facts: no
+  become: yes
+  any_errors_fatal: false
+
+  tasks:
+    - name: "IPMI | ipmitool kurulu mu"
+      command: which ipmitool
+      register: ipmitool_check
+      changed_when: false
+      failed_when: false
+
+    - name: "IPMI | ipmitool yoksa yükle"
+      dnf:
+        name: ipmitool
+        state: present
+      when: ipmitool_check.rc != 0
+
+    - name: "IPMI | Port erişilebilirlik testi (nc)"
+      command: "nc -zv -w 5 {{ ipmi_ip }} {{ ipmi_port }}"
+      register: ipmi_port_check
+      changed_when: false
+      failed_when: false
+
+    - name: "RESULT | IPMI port durumu"
+      debug:
+        msg: |
+          {% if ipmi_port_check.rc == 0 %}
+          ✓ {{ inventory_hostname }} IPMI port erişilebilir: {{ ipmi_ip }}:{{ ipmi_port }}
+          {% else %}
+          ✗ {{ inventory_hostname }} IPMI port erişilemiyor!
+            IP:Port : {{ ipmi_ip }}:{{ ipmi_port }}
+          ÇÖZÜM:
+            1. Ping testi: ping {{ ipmi_ip }}
+            2. Port testi: nc -zv {{ ipmi_ip }} {{ ipmi_port }}
+            3. Firewall kurallarını kontrol edin
+            4. hosts.yml → ipmi_port değerini doğrulayın
+          {% endif %}
+
+    - name: "IPMI | Kimlik doğrulama ve güç durumu testi"
+      command: >
+        ipmitool -I lanplus
+        -H {{ ipmi_ip }}
+        -p {{ ipmi_port }}
+        -U {{ ipmi_user }}
+        -P {{ ipmi_password }}
+        chassis power status
+      register: ipmi_test
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: "RESULT | IPMI kimlik doğrulama sonucu"
+      debug:
+        msg: |
+          {% if ipmi_test.rc == 0 %}
+          ✓ {{ inventory_hostname }} IPMI bağlantısı BAŞARILI
+            IP:Port     : {{ ipmi_ip }}:{{ ipmi_port }}
+            Güç Durumu  : {{ ipmi_test.stdout }}
+          {% else %}
+          ✗ {{ inventory_hostname }} IPMI bağlantısı BAŞARISIZ!
+            IP:Port     : {{ ipmi_ip }}:{{ ipmi_port }}
+            Kullanıcı   : {{ ipmi_user }}
+            Hata        : {{ ipmi_test.stderr }}
+          ÇÖZÜM:
+            1. Port: nc -zv {{ ipmi_ip }} {{ ipmi_port }}
+            2. User/password doğruluğunu kontrol edin
+            3. lanplus=true gerekiyor mu? (IPMI v2/iDRAC/iLO için true)
+            4. Manuel test:
+               ipmitool -I lanplus -H {{ ipmi_ip }} -p {{ ipmi_port }} -U {{ ipmi_user }} -P <pass> chassis power status
+          {% endif %}
+
+    - name: "ASSERT | IPMI bağlantısı zorunlu"
+      assert:
+        that: ipmi_test.rc == 0
+        success_msg: "✓ {{ inventory_hostname }} IPMI {{ ipmi_ip }}:{{ ipmi_port }} doğrulandı"
+        fail_msg: |
+          ✗ HATA: {{ inventory_hostname }} IPMI erişimi yok!
+          hosts.yml → ipmi_ip, ipmi_port, ipmi_user, ipmi_password değerlerini kontrol edin.
+
+
+# =============================================================================
+# PLAY 2: PAKET YÖNETİMİ - CLUSTER NODE'LARI
+# =============================================================================
+- name: "PLAY 2/13 | Cluster Node Paket Kurulumu"
+  hosts: cluster_nodes
+  gather_facts: no
+  become: yes
+  any_errors_fatal: true
+
+  tasks:
+    - name: "PACKAGE | Gereksiz/çakışan paketler kaldırılıyor"
+      dnf:
+        name:
+          - python3-google-auth
+          - python3-googleapis-common-protos
+          - python3.12-psycopg2
+          - python3-barman
+        state: absent
+        autoremove: yes
+      failed_when: false
+      register: remove_result
+
+    - name: "INFO | Kaldırılan paketler"
+      debug:
+        msg: "{{ '✓ Gereksiz paketler kaldırıldı' if remove_result.changed else 'ℹ Kaldırılacak paket bulunamadı' }}"
+
+    - name: "PACKAGE | Sistem güncellemesi"
+      dnf:
+        name: "*"
+        state: latest
+        update_only: yes
+        exclude:
+          - python3-google-auth
+          - python3-barman
+          - python3.12-psycopg2
+      async: 600
+      poll: 30
+
+    - name: "PACKAGE | HA cluster paketleri kuruluyor"
+      block:
+        - name: "PGSQL | PostgreSQL sistem modülleri devre dışı"
+          command: dnf module disable postgresql -y
+          changed_when: true
+          failed_when: false
+
+        - name: "PGSQL | Sistem postgresql paketleri kaldırılıyor"
+          dnf:
+            name:
+              - postgresql
+              - postgresql-server
+              - postgresql-private-libs
+              - postgresql-libs
+              - postgresql-contrib
+              - postgresql-odbc
+            state: absent
+            autoremove: yes
+          failed_when: false
+          register: pg_remove
+
+        - name: "INFO | PostgreSQL paket kaldırma durumu"
+          debug:
+            msg: "{{ '✓ Sistem postgresql paketleri kaldırıldı' if pg_remove.changed else 'ℹ Sistemden gelen postgresql paketi bulunamadı' }}"
+
+        - name: "PACKAGE | HA paketleri kurulumu"
+          dnf:
+            name: "{{ ha_packages }}"
+            state: present
+          register: pkg_install
+
+        - name: "INFO | Paket kurulum sonucu"
+          debug:
+            msg: "✓ HA paketleri başarıyla kuruldu"
+      rescue:
+        - name: "ERROR | Paket kurulum hatası"
+          debug:
+            msg: |
+              ✗ HATA: Paket kurulumu başarısız!
+              ÇÖZÜM:
+                1. dnf repolist → repo'ları kontrol edin
+                2. subscription-manager status → sistem kayıtlı mı?
+                3. İnternet/proxy bağlantısını kontrol edin
+                4. dnf clean all && dnf makecache
+                5. Hata mesajı: {{ ansible_failed_result.msg | default('bilinmiyor') }}
+          failed_when: true
+
+    # FIX: pgsql_pkg.rc yerine pgsql_pkg.failed kullanılıyor
+    # Eski hata: dnf modülü .rc alanı döndürmez; AttributeError oluşuyordu.
+    - name: "PACKAGE | PostgreSQL {{ pgsql_version }} ek paketleri"
+      dnf:
+        name:
+          - "postgresql{{ pgsql_version }}-server"
+          - "postgresql{{ pgsql_version }}"
+          - "python3-psycopg2"
+        state: present
+      register: pgsql_pkg
+      failed_when: false
+
+    - name: "INFO | PostgreSQL paket durumu"
+      debug:
+        msg: "{{ '✓ PostgreSQL ' + pgsql_version + ' paketleri kuruldu' if not pgsql_pkg.failed else '⚠ PostgreSQL paketleri kurulamadı - manuel kontrol gerekli: dnf install postgresql' + pgsql_version + '-server' }}"
+
+
+# =============================================================================
+# PLAY 3: PAKET YÖNETİMİ - QUORUM DEVICE
+# =============================================================================
+- name: "PLAY 3/13 | Quorum Device Paket Kurulumu"
+  hosts: quorum_device
+  gather_facts: no
+  become: yes
+  any_errors_fatal: true
+
+  tasks:
+    - name: "PACKAGE | Quorum device paketleri kuruluyor"
+      block:
+        - name: "DNF | Paketler kuruluyor"
+          dnf:
+            name: "{{ qdevice_packages }}"
+            state: present
+          register: qdev_pkg
+
+        - name: "RESULT | Quorum paket sonucu"
+          debug:
+            msg: "✓ Quorum device paketleri kuruldu: {{ qdevice_packages | join(', ') }}"
+
+        # pcs paketi kuruldu mu doğrula (pcsd bu paketle gelir)
+        - name: "CHECK | pcs paketi kurulu mu"
+          command: rpm -q pcs
+          register: pcs_rpm_check
+          changed_when: false
+
+        - name: "ASSERT | pcs paketi kurulu olmalı"
+          assert:
+            that: pcs_rpm_check.rc == 0
+            success_msg: "✓ pcs kurulu: {{ pcs_rpm_check.stdout }}"
+            fail_msg: |
+              ✗ HATA: pcs paketi kurulu değil!
+              all.yml → qdevice_packages listesine 'pcs' ekleyin.
+              Manuel: dnf install pcs -y
+
+        - name: "RESULT | Paket doğrulama özeti"
+          debug:
+            msg: |
+              ✓ Quorum device paket durumu:
+                corosync-qnetd  : kurulu
+                corosync-qdevice: kurulu
+                pcs (pcsd)      : {{ pcs_rpm_check.stdout }}
+      rescue:
+        - name: "ERROR | Quorum device paket hatası"
+          debug:
+            msg: |
+              ✗ HATA: Quorum device paket kurulumu başarısız!
+              Kurulması gereken paketler: {{ qdevice_packages | join(', ') }}
+              ÇÖZÜM:
+                1. dnf repolist → repo'ları kontrol edin
+                2. subscription-manager status → sistem kayıtlı mı?
+                3. Manuel: dnf install corosync-qnetd corosync-qdevice pcs -y
+                4. all.yml → qdevice_packages listesinde 'pcs' olduğundan emin olun
+              Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}
+          failed_when: true
+
+
+# =============================================================================
+# PLAY 4: FIREWALL YAPILANDIRMASI
+# =============================================================================
+- name: "PLAY 4/13 | Firewall Yapılandırması"
+  hosts: all
+  gather_facts: no
+  become: yes
+  any_errors_fatal: true
+
+  tasks:
+    - name: "FIREWALL | firewalld başlatılıyor ve etkinleştiriliyor"
+      systemd:
+        name: firewalld
+        state: started
+        enabled: yes
+
+    - name: "FIREWALL | Cluster node'lar için HA servisi"
+      firewalld:
+        service: high-availability
+        permanent: yes
+        state: enabled
+        immediate: yes
+      when: inventory_hostname in groups['cluster_nodes']
+
+    - name: "FIREWALL | Cluster node portları açılıyor"
+      firewalld:
+        port: "{{ item }}"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop: "{{ ha_firewall_ports }}"
+      when: inventory_hostname in groups['cluster_nodes']
+
+    - name: "FIREWALL | Quorum device - HA servisi (pcsd: 2224/tcp)"
+      firewalld:
+        service: high-availability
+        permanent: yes
+        state: enabled
+        immediate: yes
+      when: inventory_hostname in groups['quorum_device']
+
+    - name: "FIREWALL | Quorum device - qnetd portu ({{ qdevice_port }}/tcp)"
+      firewalld:
+        port: "{{ qdevice_port }}/tcp"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      when: inventory_hostname in groups['quorum_device']
+
+    - name: "FIREWALL | Kurallar yeniden yükleniyor"
+      command: firewall-cmd --reload
+      changed_when: false
+
+    - name: "RESULT | Firewall durumu"
+      debug:
+        msg: |
+          ✓ {{ inventory_hostname }} firewall yapılandırması tamamlandı
+          {% if inventory_hostname in groups['cluster_nodes'] %}
+          Servis: high-availability | Ekstra portlar: {{ ha_firewall_ports | join(', ') }}
+          {% elif inventory_hostname in groups['quorum_device'] %}
+          Servis: high-availability | qnetd port: {{ qdevice_port }}/tcp
+          {% endif %}
+
+
+# =============================================================================
+# PLAY 5: QUORUM DEVICE KURULUMU
+# =============================================================================
+- name: "PLAY 5/13 | Quorum Device Servisi Kurulumu"
+  hosts: quorum_device
+  gather_facts: no
+  become: yes
+  any_errors_fatal: true
+
+  tasks:
+    - name: "AUTH | hacluster şifresi ayarlanıyor (quorum device)"
+      user:
+        name: hacluster
+        password: "{{ cluster_password | password_hash('sha512') }}"
+        state: present
+
+    - name: "SERVICE | pcsd başlatılıyor (quorum device)"
+      systemd:
+        name: pcsd
+        state: started
+        enabled: yes
+
+    - name: "CHECK | pcsd çalışıyor mu"
+      command: systemctl is-active pcsd
+      register: pcsd_qrm_check
+      changed_when: false
+      retries: 5
+      delay: 3
+      until: pcsd_qrm_check.stdout == 'active'
+
+    - name: "RESULT | pcsd durumu"
+      debug:
+        msg: "✓ pcsd çalışıyor: {{ pcsd_qrm_check.stdout }}"
+
+    - name: "QDEVICE | corosync-qnetd kurulum ve yapılandırma"
+      block:
+        - name: "CHECK | corosync-qnetd paketi kurulu mu"
+          command: rpm -q corosync-qnetd
+          register: qnetd_pkg_check
+          changed_when: false
+          failed_when: false
+
+        - name: "CHECK | corosync-qnetd servis durumu"
+          command: systemctl is-active corosync-qnetd
+          register: qnetd_running
+          changed_when: false
+          failed_when: false
+
+        - name: "CHECK | NSS sertifika DB mevcut mu"
+          stat:
+            path: /etc/corosync/qnetd/nssdb
+          register: nssdb_stat
+
+        - name: "INFO | Mevcut durum"
+          debug:
+            msg: |
+              Paket kurulu   : {{ 'EVET → ' + qnetd_pkg_check.stdout if qnetd_pkg_check.rc == 0 else 'HAYIR' }}
+              Servis durumu  : {{ qnetd_running.stdout | default('bilinmiyor') }}
+              NSS DB mevcut  : {{ 'EVET' if nssdb_stat.stat.exists else 'HAYIR' }}
+              force_reinstall: {{ force_reinstall | default(false) | bool }}
+
+        # ---- Force Reinstall: Tam temizlik -----------------------------------
+        - name: "FORCE | corosync-qnetd servisi durduruluyor"
+          systemd:
+            name: corosync-qnetd
+            state: stopped
+            enabled: false
+          failed_when: false
+          when: force_reinstall | default(false) | bool
+
+        - name: "FORCE | pcsd servisi durduruluyor (NSS DB kilidi için)"
+          systemd:
+            name: pcsd
+            state: stopped
+          failed_when: false
+          when: force_reinstall | default(false) | bool
+
+        - name: "FORCE | corosync-qnetd paketi kaldırılıyor"
+          dnf:
+            name: corosync-qnetd
+            state: absent
+          when:
+            - force_reinstall | default(false) | bool
+            - qnetd_pkg_check.rc == 0
+
+        - name: "FORCE | NSS sertifika DB siliniyor"
+          file:
+            path: /etc/corosync/qnetd
+            state: absent
+          when: force_reinstall | default(false) | bool
+
+        - name: "FORCE | Log dizini temizleniyor"
+          file:
+            path: /var/log/corosync-qnetd
+            state: absent
+          when: force_reinstall | default(false) | bool
+          failed_when: false
+
+        - name: "FORCE | corosync-qnetd yeniden kuruluyor"
+          dnf:
+            name: corosync-qnetd
+            state: present
+          when: force_reinstall | default(false) | bool
+
+        - name: "FORCE | pcsd yeniden başlatılıyor"
+          systemd:
+            name: pcsd
+            state: started
+            enabled: true
+          when: force_reinstall | default(false) | bool
+
+        - name: "FORCE | pcsd aktif olana kadar bekleniyor"
+          command: systemctl is-active pcsd
+          register: pcsd_wait
+          retries: 10
+          delay: 5
+          until: pcsd_wait.stdout == 'active'
+          changed_when: false
+          when: force_reinstall | default(false) | bool
+
+        - name: "FORCE | Temizlik tamamlandı"
+          debug:
+            msg: "✓ corosync-qnetd + NSS DB + log dizini tamamen temizlendi"
+          when: force_reinstall | default(false) | bool
+
+        # ---- qdevice setup --------------------------------------------------
+        - name: "INSTALL | pcs qdevice setup model net"
+          command: pcs qdevice setup model net --enable --start
+          register: qdevice_setup
+          changed_when: true
+          when: >
+            (not nssdb_stat.stat.exists) or
+            (force_reinstall | default(false) | bool)
+
+        - name: "SKIP | qdevice zaten kurulu"
+          debug:
+            msg: |
+              ℹ corosync-qnetd zaten yapılandırılmış (NSS DB mevcut, servis: {{ qnetd_running.stdout }}).
+              Yeniden kurmak için: ansible-playbook ha_cluster_setup.yml -e force_reinstall=true
+          when:
+            - nssdb_stat.stat.exists
+            - not (force_reinstall | default(false) | bool)
+
+        # ---- Doğrulama -------------------------------------------------------
+        - name: "VERIFY | corosync-qnetd servis doğrulama"
+          command: systemctl is-active corosync-qnetd
+          register: qnetd_status
+          changed_when: false
+          retries: 6
+          delay: 5
+          until: qnetd_status.stdout == 'active'
+
+        - name: "VERIFY | pcs qdevice durumu"
+          command: pcs qdevice status net
+          register: qdevice_final_status
+          changed_when: false
+          failed_when: false
+
+        - name: "RESULT | Quorum device hazır"
+          debug:
+            msg: |
+              ✓ corosync-qnetd HAZIR
+              Servis : {{ qnetd_status.stdout }}
+              {{ qdevice_final_status.stdout | default('(durum alınamadı)') }}
+
+      rescue:
+        - name: "ERROR | Quorum device hata mesajı"
+          debug:
+            msg: |
+              ✗ HATA: corosync-qnetd yapılandırılamadı!
+              ► Durum kontrolleri:
+                systemctl status corosync-qnetd
+                journalctl -u corosync-qnetd -n 50
+                pcs qdevice status net
+              ► NSS DB durumu:
+                ls -la /etc/corosync/qnetd/
+              ► Tam sıfırlama:
+                ansible-playbook ha_cluster_setup.yml -e force_reinstall=true
+              ► Hata detayı: {{ ansible_failed_result.msg | default('bilinmiyor') }}
+          failed_when: true
+
+    - name: "CHECK | Quorum port dinleniyor mu ({{ qdevice_port }}/tcp)"
+      command: "ss -tlnp sport = :{{ qdevice_port }}"
+      register: qdevice_port_check
+      retries: 6
+      delay: 5
+      until: qdevice_port_check.stdout != ''
+      changed_when: false
+
+
+# =============================================================================
+# PLAY 6: iSCSI YAPILANDIRMASI
+# =============================================================================
+- name: "PLAY 6/13 | iSCSI Yapılandırması ve Disk Doğrulaması"
+  hosts: cluster_nodes
+  gather_facts: no
+  become: yes
+  any_errors_fatal: true
+
+  tasks:
+    - name: "iSCSI | Initiator adı ayarlanıyor"
+      copy:
+        content: "InitiatorName={{ iscsi_initiator_base }}:{{ inventory_hostname }}\n"
+        dest: /etc/iscsi/initiatorname.iscsi
+        mode: '0600'
+        backup: yes
+
+    - name: "iSCSI | iscsid servisi başlatılıyor"
+      systemd:
+        name: iscsid
+        state: started
+        enabled: yes
+
+    - name: "iSCSI | Target keşfediliyor"
+      block:
+        - name: iSCSI discovery
+          command: "iscsiadm -m discovery -t st -p {{ iscsi_target_ip }}"
+          register: iscsi_discovery
+          changed_when: false
+
+        - name: Discovery sonucu
+          debug:
+            msg: "✓ iSCSI target bulundu: {{ iscsi_discovery.stdout }}"
+      rescue:
+        - name: iSCSI discovery hatası
+          debug:
+            msg: |
+              ✗ HATA: iSCSI target keşfedilemedi!
+              Target IP : {{ iscsi_target_ip }}
+              ÇÖZÜM:
+                1. Target sunucu çalışıyor mu? ping {{ iscsi_target_ip }}
+                2. Firewall kuralları: target üzerinde 3260/tcp açık mı?
+                3. Manuel: iscsiadm -m discovery -t st -p {{ iscsi_target_ip }}
+                4. iscsid servis: systemctl status iscsid
+          failed_when: true
+
+    - name: "iSCSI | LUN'a login"
+      block:
+        - name: iSCSI node login
+          command: "iscsiadm -m node -T {{ iscsi_iqn }} -p {{ iscsi_target_ip }} --login"
+          register: iscsi_login
+          failed_when:
+            - iscsi_login.rc != 0
+            - "'already present' not in iscsi_login.stderr"
+            - "'already exists' not in iscsi_login.stderr"
+          changed_when: iscsi_login.rc == 0
+
+        - name: Login sonucu
+          debug:
+            msg: "✓ iSCSI LUN'a başarıyla bağlandı"
+      rescue:
+        - name: iSCSI login hatası
+          debug:
+            msg: |
+              ✗ HATA: iSCSI LUN'a login başarısız!
+              IQN    : {{ iscsi_iqn }}
+              Target : {{ iscsi_target_ip }}
+              ÇÖZÜM:
+                1. IQN doğruluğunu kontrol edin: iscsiadm -m discovery -t st -p {{ iscsi_target_ip }}
+                2. Target üzerinde initiator yetkisini kontrol edin
+                3. Manuel: iscsiadm -m node --loginall=automatic
+          failed_when: true
+
+    - name: "iSCSI | Oturum kalıcı hale getiriliyor"
+      command: >
+        iscsiadm -m node -T {{ iscsi_iqn }}
+        -p {{ iscsi_target_ip }}
+        --op update -n node.startup -v automatic
+      changed_when: false
+
+    # =========================================================================
+    # MULTIPATH KURULUM VE ALIAS YAPILANDIRMASI
+    # =========================================================================
+    # WWID → alias eşlemesi hosts.yml'deki multipath_aliases listesinden okunur.
+    # Her yeni ortamda sadece hosts.yml güncellenir; playbook değişmez.
+    #
+    # hosts.yml örneği:
+    #   multipath_aliases:
+    #     - alias: "pv_ha_shared01"
+    #       wwid:  "360014050b56232984714db8a4bdd0ea9"
+    #     - alias: "pv_ha_shared02"
+    #       wwid:  "360014056d2949ca6a2b455d82d2c6b37"
+    #
+    # WWID tespiti (kurulum öncesi): multipath -ll | grep -E '^\S.*\('
+    # =========================================================================
+
+    - name: "MULTIPATH | ASSERT - multipath_aliases hosts.yml'de tanımlı olmalı"
+      assert:
+        that:
+          - multipath_aliases is defined
+          - multipath_aliases | length >= 2
+        success_msg: "✓ multipath_aliases tanımlı: {{ multipath_aliases | map(attribute='alias') | list }}"
+        fail_msg: |
+          ✗ HATA: hosts.yml'de multipath_aliases tanımlı değil!
+          ÇÖZÜM: hosts.yml → vars bölümüne ekleyin:
+            multipath_aliases:
+              - alias: "{{ shared_disk | basename }}"
+                wwid:  "<GFS2 disk WWID - multipath -ll ile tespit edin>"
+              - alias: "{{ db_disk | basename }}"
+                wwid:  "<PostgreSQL disk WWID>"
+      run_once: true
+
+    - name: "MULTIPATH | device-mapper-multipath kurulumu"
+      dnf:
+        name:
+          - device-mapper-multipath
+          - device-mapper
+        state: present
+      failed_when: false
+
+    - name: "MULTIPATH | iscsiadm rescan (yeni LUN'ları algıla)"
+      command: iscsiadm -m session --rescan
+      changed_when: false
+      failed_when: false
+
+    - name: "MULTIPATH | /etc/multipath.conf - inventory WWID alias tanımları"
+      copy:
+        dest: /etc/multipath.conf
+        content: |
+          # Ansible tarafından yönetilir — hosts.yml → multipath_aliases
+          # WWID ve alias değişikliği için hosts.yml güncelleyin.
+          defaults {
+              user_friendly_names no
+              find_multipaths     yes
+              enable_foreign      "^$"
+          }
+          blacklist {
+              devnode "^(ram|raw|loop|fd|md|dm-|sr|scd|st)[0-9]*"
+              devnode "^hd[a-z]"
+              devnode "^vd[a-z]"
+          }
+          multipaths {
+          {% for entry in multipath_aliases %}
+              multipath {
+                  wwid  {{ entry.wwid }}
+                  alias {{ entry.alias }}
+              }
+          {% endfor %}
+          }
+        mode: '0644'
+        owner: root
+        group: root
+      register: mpath_conf_result
+
+    - name: "INFO | multipath.conf yazıldı"
+      debug:
+        msg: |
+          ✓ /etc/multipath.conf güncellendi
+          Alias tanımları (hosts.yml'den):
+          {% for entry in multipath_aliases %}
+            /dev/mapper/{{ entry.alias }} → WWID: {{ entry.wwid }}
+          {% endfor %}
+
+    - name: "MULTIPATH | multipathd başlat ve yeniden yükle"
+      systemd:
+        name: multipathd
+        state: restarted
+        enabled: yes
+
+    - name: "MULTIPATH | multipathd aktif olana kadar bekle"
+      command: systemctl is-active multipathd
+      register: multipathd_active
+      retries: 10
+      delay: 3
+      until: multipathd_active.stdout == 'active'
+      changed_when: false
+
+    - name: "MULTIPATH | multipath -v2 (alias config ile yeniden tara)"
+      command: multipath -v2
+      changed_when: false
+      failed_when: false
+
+    - name: "MULTIPATH | udevadm settle (alias device node'larının oluşmasını bekle)"
+      command: udevadm settle --timeout=30
+      changed_when: false
+      failed_when: false
+
+    - name: "MULTIPATH | Son durum"
+      command: multipath -ll
+      register: mpath_ll_final
+      changed_when: false
+      failed_when: false
+
+    - name: "INFO | Multipath alias sonucu"
+      debug:
+        msg: "{{ mpath_ll_final.stdout_lines }}"
+
+    # GFS2 diski (/dev/mapper/pv_ha_shared01)
+    - name: "CHECK | GFS2 diski bekleniyor ({{ shared_disk }})"
+      wait_for:
+        path: "{{ shared_disk }}"
+        state: present
+        timeout: 120
+      register: disk_wait_gfs2
+
+    - name: "CHECK | GFS2 disk bilgisi"
+      command: "lsblk -b -o NAME,SIZE,TYPE {{ shared_disk }}"
+      register: disk_info_gfs2
+      changed_when: false
+
+    - name: "RESULT | GFS2 diski"
+      debug:
+        msg: |
+          ✓ GFS2 diski hazır: {{ shared_disk }}
+          {{ disk_info_gfs2.stdout }}
+
+    # PostgreSQL diski (/dev/mapper/pv_ha_shared02)
+    - name: "CHECK | PostgreSQL diski bekleniyor ({{ db_disk }})"
+      wait_for:
+        path: "{{ db_disk }}"
+        state: present
+        timeout: 120
+      register: disk_wait_db
+
+    - name: "CHECK | PostgreSQL disk bilgisi"
+      command: "lsblk -b -o NAME,SIZE,TYPE {{ db_disk }}"
+      register: disk_info_db
+      changed_when: false
+
+    - name: "RESULT | PostgreSQL diski"
+      debug:
+        msg: |
+          ✓ PostgreSQL diski hazır: {{ db_disk }}
+          {{ disk_info_db.stdout }}
+
+
+# =============================================================================
+# PLAY 7: HACLUSTER KULLANICISI VE PCSD
+# =============================================================================
+- name: "PLAY 7/13 | hacluster Kullanıcısı ve PCSD Hazırlığı"
+  hosts: cluster_nodes
+  gather_facts: no
+  become: yes
+  any_errors_fatal: true
+
+  tasks:
+    - name: "AUTH | hacluster şifresi ayarlanıyor"
+      user:
+        name: hacluster
+        password: "{{ cluster_password | password_hash('sha512') }}"
+        state: present
+
+    - name: "SERVICE | pcsd başlatılıyor"
+      systemd:
+        name: pcsd
+        state: started
+        enabled: yes
+
+    - name: "CHECK | pcsd çalışıyor mu"
+      command: systemctl is-active pcsd
+      register: pcsd_check
+      changed_when: false
+      retries: 5
+      delay: 3
+      until: pcsd_check.stdout == 'active'
+
+    - name: "RESULT | pcsd durumu"
+      debug:
+        msg: "✓ pcsd çalışıyor: {{ pcsd_check.stdout }}"
+
+    # FIX: Hem cluster node'ları hem de quorum device authenticate ediliyor
+    # Eski hata: Sadece cluster node'ları authenticate ediliyordu.
+    # Quorum device pcsd'si de authenticate edilmeli (pcs cluster setup için).
+    - name: "AUTH | Tüm cluster node'ları authenticate ediliyor"
+      command: >
+        pcs host auth
+        {% for host in groups['cluster_nodes'] %}
+        {{ host }} addr={{ hostvars[host].cluster_ip }}
+        {% endfor %}
+        -u hacluster -p {{ cluster_password }}
+      run_once: true
+      delegate_to: "{{ groups['cluster_nodes'][0] }}"
+      register: pcs_auth
+      failed_when: pcs_auth.rc != 0 and 'already authorized' not in (pcs_auth.stderr | default(''))
+      changed_when: pcs_auth.rc == 0
+
+    - name: "RESULT | Node authentication"
+      debug:
+        msg: "✓ Cluster node'ları authenticate edildi"
+      run_once: true
+
+    - name: "AUTH | Quorum device authenticate ediliyor (cluster node'larından)"
+      command: >
+        pcs host auth
+        {{ groups['quorum_device'][0] }}
+        addr={{ hostvars[groups['quorum_device'][0]].ansible_host }}
+        -u hacluster -p {{ cluster_password }}
+      run_once: true
+      delegate_to: "{{ groups['cluster_nodes'][0] }}"
+      register: pcs_qrm_auth
+      failed_when: pcs_qrm_auth.rc != 0 and 'already authorized' not in (pcs_qrm_auth.stderr | default(''))
+      changed_when: pcs_qrm_auth.rc == 0
+
+    - name: "RESULT | Quorum device authentication"
+      debug:
+        msg: "✓ Quorum device {{ groups['quorum_device'][0] }} authenticate edildi"
+      run_once: true
+
+
+# =============================================================================
+# PLAY 7b: COROSYNC ÖN KONTROLLER ve KAPSAMLI TEMİZLİK
+# =============================================================================
+# corosync başlama hatalarının %90'ı:
+#   1. cluster_ip interface'e bind edilmemiş / yanlış
+#   2. Eski corosync state dosyaları (kirli restart)
+#   3. Eski authkey ile yeni corosync.conf uyumsuzluğu
+#   4. totem ring adresi çözümlenemiyor
+# Bu play bunların hepsini PLAY 8'den önce kontrol eder ve temizler.
+# =============================================================================
+- name: "PLAY 7b/13 | Corosync Ön Kontroller ve Kapsamlı Temizlik"
+  hosts: cluster_nodes
+  gather_facts: yes
+  become: yes
+  any_errors_fatal: true
+
+  tasks:
+    # ---- Cluster IP Kontrolü -----------------------------------------------
+    - name: "PRECHECK | cluster_ip interface'e atanmış mı"
+      command: "ip addr show"
+      register: ip_addr_full
+      changed_when: false
+
+    - name: "PRECHECK | cluster_ip bul"
+      set_fact:
+        cluster_ip_bound: "{{ cluster_ip in ip_addr_full.stdout }}"
+
+    - name: "ASSERT | cluster_ip interface'e bağlı olmalı"
+      assert:
+        that: cluster_ip_bound
+        success_msg: "✓ cluster_ip {{ cluster_ip }} interface'e bağlı"
+        fail_msg: |
+          ✗ HATA: cluster_ip {{ cluster_ip }} hiçbir interface'e bağlı değil!
+          Mevcut IP'ler:
+          {{ ip_addr_full.stdout }}
+          ÇÖZÜM:
+            1. hosts.yml → cluster_ip değeri doğru mu? ({{ cluster_ip }})
+            2. İkinci NIC (cluster ağı) yapılandırıldı mı?
+               ip addr add {{ cluster_ip }}/24 dev <interface>
+            3. nmcli con show → cluster ağ bağlantısı aktif mi?
+
+    - name: "PRECHECK | cluster_ip ping testi (node'dan node'a)"
+      command: "ping -c 2 -W 2 {{ hostvars[item].cluster_ip }}"
+      loop: "{{ groups['cluster_nodes'] }}"
+      register: cluster_ping
+      changed_when: false
+      failed_when: false
+
+    - name: "RESULT | Cluster network ping sonuçları"
+      debug:
+        msg: |
+          {% for result in cluster_ping.results %}
+          {{ '✓' if result.rc == 0 else '✗' }} {{ result.item }} ({{ hostvars[result.item].cluster_ip }}): {{ 'ERİŞİLEBİLİR' if result.rc == 0 else 'ERİŞİLEMİYOR!' }}
+          {% endfor %}
+
+    - name: "WARN | Cluster ağı erişilemiyor"
+      debug:
+        msg: |
+          ✗ UYARI: Bazı cluster IP'leri ping'e yanıt vermiyor!
+          Bu corosync ring başlatma hatasına neden olur.
+          ÇÖZÜM: Cluster ağ bağlantısını kontrol edin ({{ cluster_ip }} ağı)
+      when: cluster_ping.results | selectattr('rc', 'ne', 0) | list | length > 0
+
+    # ---- Corosync Port Kontrolü --------------------------------------------
+    - name: "PRECHECK | corosync portları açık mı (5405, 5406/udp)"
+      command: "firewall-cmd --list-ports"
+      register: fw_ports
+      changed_when: false
+      failed_when: false
+
+    - name: "PRECHECK | corosync portları firewall'da mevcut mu"
+      debug:
+        msg: |
+          Açık portlar: {{ fw_ports.stdout }}
+          Corosync gerekli: 5405/udp, 5406/udp
+
+    # ---- Kapsamlı Corosync/Pacemaker State Temizliği -----------------------
+    # force_reinstall=false olsa bile stale state dosyaları kaldırılır.
+    # Bu dosyalar olmadan ha_cluster rolü temiz başlar.
+    - name: "CLEAN | Eski corosync.conf kaldırılıyor (ha_cluster rolü yenisini üretir)"
+      file:
+        path: /etc/corosync/corosync.conf
+        state: absent
+      failed_when: false
+
+    - name: "CLEAN | Eski corosync authkey kaldırılıyor"
+      file:
+        path: /etc/corosync/authkey
+        state: absent
+      failed_when: false
+
+    - name: "CLEAN | Eski pacemaker CIB kaldırılıyor"
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/pacemaker/cib/cib.xml
+        - /var/lib/pacemaker/cib/cib.xml.last
+        - /var/lib/pacemaker/pengine
+      failed_when: false
+
+    # FIX: /var/lib/corosync dizini KALDIRILMAZ - sadece içi temizlenir.
+    # Corosync bu dizin olmadan "Cannot chdir" (exit 16) hatası verir!
+    - name: "CLEAN | corosync ring/state dosyaları temizleniyor (dizin korunuyor)"
+      shell: "rm -f /var/lib/corosync/ringid_* /var/lib/corosync/quorum 2>/dev/null || true"
+      changed_when: false
+      failed_when: false
+
+    - name: "CLEAN | /var/lib/corosync dizini garanti altına alınıyor"
+      file:
+        path: /var/lib/corosync
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: "CLEAN | pcs pcsd token cache temizleniyor (eski auth tokenları)"
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/pcsd/known-hosts
+        - /var/lib/pcsd/pcs_settings.conf
+        - /var/lib/pcsd/tokens
+      failed_when: false
+
+    # ---- Servis Durumu Kontrolleri -----------------------------------------
+    - name: "PRECHECK | Eski corosync/pacemaker servisleri durdur"
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - pacemaker
+        - corosync
+        - corosync-qdevice
+      failed_when: false
+
+    - name: "PRECHECK | pcsd yeniden başlat (cache temizlendi)"
+      systemd:
+        name: pcsd
+        state: restarted
+        enabled: yes
+
+    - name: "PRECHECK | pcsd aktif bekle"
+      command: systemctl is-active pcsd
+      register: pcsd_restart_check
+      retries: 10
+      delay: 3
+      until: pcsd_restart_check.stdout == 'active'
+      changed_when: false
+
+    # ---- Re-authentication (pcsd yeniden başladı, token'lar temizlendi) ----
+    - name: "AUTH | pcsd yeniden başladıktan sonra node'lar re-authenticate"
+      command: >
+        pcs host auth
+        {% for host in groups['cluster_nodes'] %}
+        {{ host }} addr={{ hostvars[host].cluster_ip }}
+        {% endfor %}
+        -u hacluster -p {{ cluster_password }}
+      run_once: true
+      delegate_to: "{{ groups['cluster_nodes'][0] }}"
+      register: reauth_result
+      failed_when: reauth_result.rc != 0 and 'already authorized' not in (reauth_result.stderr | default(''))
+      changed_when: reauth_result.rc == 0
+
+    - name: "AUTH | Quorum device re-authenticate"
+      command: >
+        pcs host auth
+        {{ groups['quorum_device'][0] }}
+        addr={{ hostvars[groups['quorum_device'][0]].ansible_host }}
+        -u hacluster -p {{ cluster_password }}
+      run_once: true
+      delegate_to: "{{ groups['cluster_nodes'][0] }}"
+      register: reauth_qrm
+      failed_when: reauth_qrm.rc != 0 and 'already authorized' not in (reauth_qrm.stderr | default(''))
+      changed_when: reauth_qrm.rc == 0
+
+    # Interface adları hosts.yml'den okunuyor (public_nic / cluster_nic).
+    # Bu sayede dinamik tespit yerine açık, güvenilir konfigürasyon kullanılıyor.
+    - name: "PRECHECK | Interface yapılandırması doğrulanıyor"
+      assert:
+        that:
+          - public_nic is defined
+          - cluster_nic is defined
+        success_msg: "✓ Interface'ler tanımlı: public={{ public_nic }}, cluster={{ cluster_nic }}"
+        fail_msg: |
+          ✗ HATA: hosts.yml'de public_nic ve cluster_nic tanımlanmamış!
+          Şu satırları hosts.yml vars bölümüne ekleyin:
+            public_nic: "enp1s0"   # VIP ağı (192.168.0.x)
+            cluster_nic: "enp2s0"  # Corosync ağı (172.16.16.x)
+
+    - name: "PRECHECK | public_nic ({{ public_nic }}) doğru IP'yi taşıyor mu"
+      shell: "ip addr show {{ public_nic }} | grep '{{ ansible_host }}'"
+      register: public_nic_check
+      changed_when: false
+      failed_when: false
+
+    - name: "WARN | public_nic doğrulaması"
+      debug:
+        msg: |
+          {% if public_nic_check.rc == 0 %}
+          ✓ {{ public_nic }} → {{ ansible_host }} (VIP ağı doğrulandı)
+          {% else %}
+          ⚠ UYARI: {{ public_nic }} üzerinde {{ ansible_host }} bulunamadı!
+            Mevcut interface'ler:
+            {{ ansible_interfaces | default([]) | join(', ') }}
+            hosts.yml → public_nic değerini kontrol edin.
+          {% endif %}
+
+    - name: "PRECHECK | cluster_nic ({{ cluster_nic }}) doğru IP'yi taşıyor mu"
+      shell: "ip addr show {{ cluster_nic }} | grep '{{ cluster_ip }}'"
+      register: cluster_nic_check
+      changed_when: false
+      failed_when: false
+
+    - name: "WARN | cluster_nic doğrulaması"
+      debug:
+        msg: |
+          {% if cluster_nic_check.rc == 0 %}
+          ✓ {{ cluster_nic }} → {{ cluster_ip }} (Corosync ağı doğrulandı)
+          {% else %}
+          ⚠ UYARI: {{ cluster_nic }} üzerinde {{ cluster_ip }} bulunamadı!
+            hosts.yml → cluster_nic değerini kontrol edin.
+          {% endif %}
+
+    - name: "RESULT | Ön kontroller tamamlandı"
+      debug:
+        msg: |
+          ✓ PLAY 7b tamamlandı:
+            cluster_ip bağlı : {{ cluster_ip_bound }}
+            VIP interface    : {{ public_nic }}
+            pcsd aktif       : {{ pcsd_restart_check.stdout }}
+            State temizlendi : corosync.conf, authkey, CIB, ring state, pcsd cache
+            Re-auth          : cluster node'lar + quorum device
+
+
+# =============================================================================
+# PLAY 8: HA CLUSTER KURULUMU (Red Hat System Roles)
+# =============================================================================
+# any_errors_fatal: FALSE — rol hata verince post_tasks çalışsın ve
+# tam teşhis raporu üretilsin. PLAY 8-diag başarı/başarısızlık kararını verir.
+# =============================================================================
+- name: "PLAY 8/13 | HA Cluster Kurulumu - Red Hat System Roles"
+  hosts: cluster_nodes
+  gather_facts: yes
+  become: yes
+  any_errors_fatal: false      # ← Teşhis için false; PLAY 8-diag fail eder
+
+  # FIX: ha_cluster rolü SADECE corosync+pacemaker kurulumunu yapar.
+  # Kaynaklar (STONITH, DLM, VIP) PLAY 8c'de pcs komutuyla güvenle eklenir.
+  # Neden: _fence_primitives | from_yaml Jinja2→Python repr→YAML pipeline'ı
+  # Boolean değerleri (True/False) hatalı parse eder → sessizce 0 kaynak.
+  vars:
+    ha_cluster_enable_repos: false
+    ha_cluster_cluster_name: "{{ cluster_name }}"
+    ha_cluster_hacluster_password: "{{ cluster_password }}"
+
+    ha_cluster_transport:
+      type: knet
+      options:
+        - name: ip_version
+          value: ipv4
+
+    ha_cluster_node_options: >-
+      {%- set ns = namespace(nodes=[]) -%}
+      {%- for host in groups['cluster_nodes'] -%}
+        {%- set node = {'node_name': host, 'corosync_addresses': [hostvars[host].cluster_ip]} -%}
+        {%- set _ = ns.nodes.append(node) -%}
+      {%- endfor -%}
+      {{ ns.nodes }}
+
+    ha_cluster_fence_agent_packages:
+      - fence-agents-ipmilan
+      - ipmitool
+
+    # Cluster özellikleri rolde de set edilsin
+    ha_cluster_cluster_properties: "{{ cluster_properties }}"
+    ha_cluster_resource_defaults: "{{ resource_defaults }}"
+
+  pre_tasks:
+    - name: "PRE | Stale qdevice client NSS DB temizleniyor"
+      file:
+        path: /etc/corosync/qdevice/net/nssdb
+        state: absent
+      failed_when: false
+
+    - name: "FORCE | Cluster sıfırlama (force_reinstall=true)"
+      block:
+        - name: "FORCE | Cluster durumu kontrol"
+          command: pcs status
+          register: cluster_exists_check
+          changed_when: false
+          failed_when: false
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "FORCE | Maintenance mode aktif"
+          command: pcs property set maintenance-mode=true
+          failed_when: false
+          changed_when: true
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+          when: cluster_exists_check.rc == 0
+
+        - name: "FORCE | Cluster servisleri durduruluyor"
+          command: pcs cluster stop --all --force --request-timeout=60
+          failed_when: false
+          changed_when: true
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "FORCE | corosync/pacemaker durdurma (her node)"
+          systemd:
+            name: "{{ item }}"
+            state: stopped
+          loop:
+            - pacemaker
+            - corosync
+            - corosync-qdevice
+          failed_when: false
+
+        - name: "FORCE | Cluster yapılandırması siliniyor"
+          command: pcs cluster destroy --all
+          failed_when: false
+          changed_when: true
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        # FIX: /var/lib/corosync dizini silinmez, sadece içi temizlenir.
+        - name: "FORCE | corosync/pacemaker config dosyaları siliniyor"
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /etc/corosync/corosync.conf
+            - /etc/corosync/authkey
+            - /etc/corosync/qdevice
+            - /var/lib/pacemaker/cib
+            - /var/lib/pacemaker/pengine
+            - /var/lib/pacemaker/cores
+            - /var/lib/pcsd/known-hosts
+            - /var/lib/pcsd/tokens
+            - /var/lib/pcsd/pcs_settings.conf
+          failed_when: false
+
+        - name: "FORCE | /var/lib/corosync icerigi temizleniyor (dizin korunuyor)"
+          shell: "rm -rf /var/lib/corosync/* 2>/dev/null || true"
+          changed_when: false
+          failed_when: false
+
+        - name: "FORCE | Kritik dizinler yeniden olusturuluyor"
+          file:
+            path: "{{ item.path }}"
+            state: directory
+            owner: "{{ item.owner }}"
+            group: "{{ item.group }}"
+            mode: "{{ item.mode }}"
+          loop:
+            - { path: /var/lib/corosync,           owner: root,      group: root,      mode: "0750" }
+            - { path: /var/lib/pacemaker,          owner: hacluster, group: haclient,  mode: "0750" }
+            - { path: /var/lib/pacemaker/cib,      owner: hacluster, group: haclient,  mode: "0750" }
+            - { path: /var/lib/pacemaker/pengine,  owner: hacluster, group: haclient,  mode: "0750" }
+            - { path: /var/lib/pacemaker/cores,    owner: hacluster, group: haclient,  mode: "0750" }
+            - { path: /var/lib/pacemaker/blackbox, owner: hacluster, group: haclient,  mode: "0750" }
+          failed_when: false
+
+        - name: "FORCE | pcsd yeniden başlat"
+          systemd:
+            name: pcsd
+            state: restarted
+
+        - name: "FORCE | pcsd aktif bekle"
+          command: systemctl is-active pcsd
+          register: pcsd_force_wait
+          retries: 10
+          delay: 3
+          until: pcsd_force_wait.stdout == 'active'
+          changed_when: false
+
+        - name: "FORCE | Re-authenticate tüm node'lar"
+          command: >
+            pcs host auth
+            {% for host in groups['cluster_nodes'] %}
+            {{ host }} addr={{ hostvars[host].cluster_ip }}
+            {% endfor %}
+            -u hacluster -p {{ cluster_password }}
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+          register: force_reauth
+          failed_when: force_reauth.rc != 0 and 'already authorized' not in (force_reauth.stderr | default(''))
+          changed_when: force_reauth.rc == 0
+
+        - name: "INFO | Cluster temizlendi"
+          debug:
+            msg: "✓ Cluster sıfırlandı"
+          run_once: true
+      when: force_reinstall | default(false) | bool
+
+  roles:
+    - redhat.rhel_system_roles.ha_cluster
+
+  post_tasks:
+    - name: "POST | corosync servis durumu (HATA DURUMUNDA TEŞHİS)"
+      command: systemctl status corosync --no-pager -l
+      register: corosync_svc_post
+      changed_when: false
+      failed_when: false
+
+    - name: "POST | corosync.conf içeriği"
+      command: cat /etc/corosync/corosync.conf
+      register: corosync_conf_post
+      changed_when: false
+      failed_when: false
+
+    - name: "POST | corosync journal (son 60 satır)"
+      command: journalctl -u corosync -n 60 --no-pager
+      register: corosync_journal_post
+      changed_when: false
+      failed_when: false
+
+    - name: "POST | SELinux audit (corosync redleri)"
+      command: ausearch -m AVC -ts recent -c corosync
+      register: selinux_audit_post
+      changed_when: false
+      failed_when: false
+
+    - name: "POST | iptables INPUT kuralları (firewalld dışı kural var mı)"
+      command: iptables -L INPUT -n --line-numbers
+      register: iptables_post
+      changed_when: false
+      failed_when: false
+
+    - name: "POST | Üretilen corosync.conf raporu"
+      debug:
+        msg: |
+          ══════════ corosync.conf ({{ inventory_hostname }}) ══════════
+          {{ corosync_conf_post.stdout | default('DOSYA YOK - rol başarısız oldu') }}
+      run_once: true
+
+    - name: "POST | corosync servis + journal raporu"
+      debug:
+        msg: |
+          ══════ systemctl status corosync ({{ inventory_hostname }}) ══════
+          {{ corosync_svc_post.stdout | default('ALINAMADI') }}
+          ══════ journalctl -u corosync son 60 satır ══════
+          {{ corosync_journal_post.stdout | default('LOG YOK') }}
+          ══════ SELinux AVC (corosync) ══════
+          {{ selinux_audit_post.stdout | default('(temiz veya ausearch yok)') }}
+          ══════ iptables INPUT ══════
+          {{ iptables_post.stdout | default('ALINAMADI') }}
+
+
+# =============================================================================
+# PLAY 8-diag: COROSYNC BAŞLATMA DOĞRULAMA (her zaman çalışır)
+# =============================================================================
+# any_errors_fatal:false olan PLAY 8'den sonra burası fail/pass kararını verir.
+# Corosync çalışıyorsa devam, yoksa tam teşhis ile durur.
+# =============================================================================
+- name: "PLAY 8-diag | Corosync/Pacemaker Doğrulama ve Teşhis"
+  hosts: cluster_nodes
+  gather_facts: no
+  become: yes
+  any_errors_fatal: true
+
+  tasks:
+    - name: "DIAG | corosync aktif mi"
+      command: systemctl is-active corosync
+      register: corosync_active
+      changed_when: false
+      failed_when: false
+
+    - name: "DIAG | pacemaker aktif mi"
+      command: systemctl is-active pacemaker
+      register: pacemaker_active
+      changed_when: false
+      failed_when: false
+
+    - name: "DIAG | pcs status"
+      command: pcs status
+      register: pcs_status_diag
+      changed_when: false
+      failed_when: false
+      run_once: true
+      delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+    - name: "RESULT | Servis durumu özeti"
+      debug:
+        msg: |
+          Node            : {{ inventory_hostname }}
+          corosync        : {{ corosync_active.stdout }}
+          pacemaker       : {{ pacemaker_active.stdout }}
+
+    - name: "RESULT | pcs status"
+      debug:
+        msg: "{{ pcs_status_diag.stdout_lines }}"
+      run_once: true
+
+    # corosync çalışmıyorsa derinlemesine teşhis ve anlamlı hata
+    - name: "DIAG | Detaylı hata analizi (corosync çalışmıyorsa)"
+      block:
+        - name: "DIAG | corosync son 80 journal satırı"
+          command: journalctl -u corosync -n 80 --no-pager
+          register: corosync_journal_diag
+          changed_when: false
+          failed_when: false
+
+        - name: "DIAG | corosync.conf mevcut mu"
+          stat:
+            path: /etc/corosync/corosync.conf
+          register: corosync_conf_stat
+
+        - name: "DIAG | corosync.conf içeriği"
+          command: cat /etc/corosync/corosync.conf
+          register: corosync_conf_diag
+          changed_when: false
+          failed_when: false
+          when: corosync_conf_stat.stat.exists
+
+        - name: "DIAG | Cluster IP ring testi"
+          command: "ping -c 3 -W 2 {{ hostvars[item].cluster_ip }}"
+          loop: "{{ groups['cluster_nodes'] }}"
+          register: ring_ping
+          changed_when: false
+          failed_when: false
+
+        - name: "DIAG | SELinux audit son 30 satır"
+          command: ausearch -m AVC -ts recent
+          register: selinux_diag
+          changed_when: false
+          failed_when: false
+
+        - name: "DIAG | NetworkManager cluster ağı durumu"
+          command: nmcli con show
+          register: nmcli_diag
+          changed_when: false
+          failed_when: false
+
+        - name: "DIAG | Cluster IP - hangi interface"
+          command: "ip addr show"
+          register: ip_show_diag
+          changed_when: false
+          failed_when: false
+
+        - name: "FAIL | TAM TEŞHİS RAPORU ile Hata"
+          fail:
+            msg: |
+              ╔══════════════════════════════════════════════════════════════╗
+              ║  COROSYNC BAŞLATMA HATASI - {{ inventory_hostname }}
+              ╚══════════════════════════════════════════════════════════════╝
+
+              [corosync.conf {{ 'MEVCUT' if corosync_conf_stat.stat.exists else 'YOK - ROL CONF ÜRETEMEDİ!' }}]
+              {{ corosync_conf_diag.stdout | default('(dosya yok)') }}
+
+              [journalctl -u corosync son 80 satır]
+              {{ corosync_journal_diag.stdout | default('LOG YOK') }}
+
+              [ip addr show]
+              {{ ip_show_diag.stdout }}
+
+              [NetworkManager bağlantıları]
+              {{ nmcli_diag.stdout | default('nmcli yok') }}
+
+              [Cluster ring ping sonuçları]
+              {% for r in ring_ping.results %}
+              {{ '✓' if r.rc == 0 else '✗' }} {{ r.item }} ({{ hostvars[r.item].cluster_ip }}): {{ 'ERİŞİLEBİLİR' if r.rc == 0 else 'ERİŞİLEMİYOR' }}
+              {% endfor %}
+
+              [SELinux AVC son kayıtlar]
+              {{ selinux_diag.stdout | default('(temiz)') }}
+
+              ═══════════════════════════════════════════════════════════════
+              OLASI NEDENLER VE ÇÖZÜMLER:
+
+              1. cluster_ip ({{ cluster_ip }}) interface'e bind değil:
+                 → ip addr | grep {{ cluster_ip }}
+                 → nmcli con mod <bağlantı> ipv4.addresses {{ cluster_ip }}/24
+                 → nmcli con up <bağlantı>
+
+              2. Cluster ağı (172.16.16.x) node'lar arası ulaşamıyor:
+                 → Her iki node'da: ping {{ hostvars[groups['cluster_nodes'] | reject('eq', inventory_hostname) | first].cluster_ip }}
+                 → Switch VLAN / kablo bağlantısını kontrol edin
+
+              3. corosync.conf üretilemedi (pcs cluster setup başarısız):
+                 → journalctl -u pcsd -n 50 --no-pager
+                 → pcs cluster setup --debug {{ cluster_name }} {% for h in groups['cluster_nodes'] %}{{ h }} addr={{ hostvars[h].cluster_ip }} {% endfor %}
+
+              4. SELinux engeli:
+                 → ausearch -m AVC -ts recent | grep corosync
+                 → setenforce 0 (geçici test), sonra: audit2allow -a -M corosync_local
+
+              5. Stale state (authkey uyumsuzluğu):
+                 → ansible-playbook ha_cluster_setup.yml -e force_reinstall=true
+
+              6. Firewall/iptables - 5405/udp, 5406/udp, 2224/tcp kapalı:
+                 → firewall-cmd --list-all
+                 → iptables -L INPUT -n | grep -E "5405|5406|2224"
+              ═══════════════════════════════════════════════════════════════
+      when: corosync_active.stdout != 'active'
+
+    - name: "✓ Corosync ve Pacemaker çalışıyor"
+      debug:
+        msg: |
+          ✓ {{ inventory_hostname }}:
+            corosync  : {{ corosync_active.stdout }}
+            pacemaker : {{ pacemaker_active.stdout }}
+      when: corosync_active.stdout == 'active'
+
+
+# =============================================================================
+# PLAY 8b: QUORUM DEVICE EKLEME (Rolden ayrı - race condition önlemi)
+# =============================================================================
+# ha_cluster rolü quorum device'ı iki node'da paralel yapılandırıyordu.
+# Bu, qnetd NSS DB üzerinde race condition yaratıyordu.
+# Çözüm: qdevice run_once ile tek seferden, sıralı pcs komutuyla ekleniyor.
+# =============================================================================
+- name: "PLAY 8b/13 | Quorum Device Ekleme (Sıralı - Race Condition Önlemi)"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+  any_errors_fatal: true
+
+  tasks:
+    - name: "QDEVICE | Cluster hazır bekle"
+      command: pcs status
+      register: cluster_ready
+      retries: 10
+      delay: 6
+      until: cluster_ready.rc == 0
+      changed_when: false
+
+    # HATA DÜZELTME: 'pcs quorum status' çıktısında "Qdevice" kelimesi HER ZAMAN
+    # tablo başlığında geçer ("Nodeid  Votes  Qdevice  Name") — qdevice kurulmamış
+    # olsa bile. Eski kontrol bu yüzden her zaman True döndürüp qdevice add'i skip ediyordu.
+    #
+    # DOĞRU KONTROL: 'pcs quorum device status'
+    # Qdevice gerçekten eklenmiş   → rc=0, "Algorithm:" çıktısı
+    # Qdevice eklenmemiş           → rc=1, "no quorum device configured"
+    - name: "QDEVICE | Quorum device gerçekten eklenmiş mi (güvenilir kontrol)"
+      command: pcs quorum device status
+      register: qdevice_status_check
+      changed_when: false
+      failed_when: false
+
+    - name: "INFO | Quorum device durumu"
+      debug:
+        msg: "{{ 'Qdevice MEVCUT: ' + qdevice_status_check.stdout if qdevice_status_check.rc == 0 else 'Qdevice YOK — eklenecek' }}"
+
+    - name: "QDEVICE | Quorum device yapılandırması"
+      block:
+        # Force reinstall: mevcut qdevice kaldır
+        - name: "FORCE | Mevcut qdevice kaldırılıyor"
+          command: pcs quorum device remove
+          failed_when: false
+          changed_when: true
+          when:
+            - force_reinstall | default(false) | bool
+            - qdevice_status_check.rc == 0
+
+        # pcs quorum device status rc=0 → zaten ekli; rc!=0 → eklenecek
+        - name: "CHECK | qdevice zaten eklenmiş mi"
+          set_fact:
+            qdevice_already_configured: "{{ qdevice_status_check.rc == 0 and not (force_reinstall | default(false) | bool) }}"
+
+        - name: "SKIP | qdevice zaten yapılandırılmış"
+          debug:
+            msg: |
+              ℹ Quorum device zaten eklenmiş (pcs quorum device status rc=0), atlanıyor.
+              Yeniden eklemek için: ansible-playbook ... -e force_reinstall=true
+          when: qdevice_already_configured
+
+        # qdevice ekle - cluster node'larında PCsd authenticate hazır olmalı
+        - name: "QDEVICE | pcs host auth - quorum device authenticate"
+          command: >
+            pcs host auth
+            {{ groups['quorum_device'][0] }}
+            addr={{ hostvars[groups['quorum_device'][0]].ansible_host }}
+            -u hacluster -p {{ cluster_password }}
+          register: qrm_auth
+          failed_when: qrm_auth.rc != 0 and 'already authorized' not in (qrm_auth.stderr | default(''))
+          changed_when: qrm_auth.rc == 0
+          when: not qdevice_already_configured
+
+        - name: "QDEVICE | pcs quorum device add"
+          command: >
+            pcs quorum device add
+            model net
+            host={{ groups['quorum_device'][0] }}
+            algorithm={{ qdevice_algorithm }}
+            port={{ qdevice_port }}
+          register: qdevice_add
+          failed_when:
+            - qdevice_add.rc != 0
+            - "'already exists' not in (qdevice_add.stderr | default(''))"
+            - "'already configured' not in (qdevice_add.stderr | default(''))"
+          changed_when: qdevice_add.rc == 0
+          when: not qdevice_already_configured
+
+        - name: "RESULT | qdevice eklendi"
+          debug:
+            msg: "✓ Quorum device eklendi: {{ groups['quorum_device'][0] }} ({{ qdevice_algorithm }})"
+          when: not qdevice_already_configured
+
+        # Tüm node'larda qdevice servisini başlat
+        - name: "QDEVICE | corosync-qdevice servisi başlatılıyor (tüm cluster node'ları)"
+          systemd:
+            name: corosync-qdevice
+            state: started
+            enabled: yes
+          delegate_to: "{{ item }}"
+          loop: "{{ groups['cluster_nodes'] }}"
+          failed_when: false
+
+        # Quorum durumu doğrula
+        - name: "VERIFY | Quorum durumu bekleniyor"
+          command: corosync-quorumtool -s
+          register: final_quorum
+          retries: 10
+          delay: 5
+          until: "'Quorate:  Yes' in final_quorum.stdout or 'quorate' in final_quorum.stdout | lower"
+          changed_when: false
+          failed_when: false
+
+        - name: "VERIFY | pcs quorum durumu"
+          command: pcs quorum status
+          register: pcs_quorum_final
+          changed_when: false
+          failed_when: false
+
+        - name: "RESULT | Quorum device sonuç"
+          debug:
+            msg: |
+              ✓ Quorum device yapılandırması tamamlandı
+              {{ pcs_quorum_final.stdout }}
+              {{ final_quorum.stdout }}
+
+      rescue:
+        - name: "ERROR | Quorum device ekleme hatası"
+          debug:
+            msg: |
+              ✗ HATA: Quorum device eklenemedi!
+              ÇÖZÜM:
+                1. qnetd servisi çalışıyor mu: systemctl status corosync-qnetd ({{ groups['quorum_device'][0] }})
+                2. Firewall: {{ qdevice_port }}/tcp açık mı? (her iki tarafta)
+                3. Auth: pcs host auth {{ groups['quorum_device'][0] }} addr={{ hostvars[groups['quorum_device'][0]].ansible_host }} -u hacluster -p <parola>
+                4. Manuel ekle:
+                   pcs quorum device add model net host={{ groups['quorum_device'][0] }} algorithm={{ qdevice_algorithm }}
+                5. qdevice log: journalctl -u corosync-qdevice -n 50
+              Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}
+          failed_when: true
+
+
+
+# =============================================================================
+# PLAY 8c: STONITH + TEMEL CLUSTER KAYNAKLARI (pcs ile güvenli ekleme)
+# =============================================================================
+# ha_cluster rolü Jinja2 Python repr → YAML parse sorunları nedeniyle kaynakları
+# güvenilir şekilde ekleyemiyordu. Burada her kaynak pcs komutuyla tek tek,
+# idempotent biçimde ekleniyor.
+# =============================================================================
+- name: "PLAY 8c/13 | STONITH ve Temel Cluster Kaynakları"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+  any_errors_fatal: true
+
+  tasks:
+    - name: "PREP | Cluster hazır bekle"
+      command: pcs status
+      register: cluster_ready_8c
+      retries: 12
+      delay: 5
+      until: cluster_ready_8c.rc == 0
+      changed_when: false
+
+    - name: "PREP | Cluster özellikleri ayarlanıyor"
+      command: >
+        pcs property set
+        stonith-enabled=true
+        stonith-action={{ stonith_action }}
+        no-quorum-policy={{ no_quorum_policy }}
+        start-failure-is-fatal=false
+      register: prop_set
+      failed_when: prop_set.rc != 0
+      changed_when: true
+      # start-failure-is-fatal=false: Başlatma hatası o node'u kalıcı olarak
+      # dışlamaz — migration-threshold dolduğunda bile başka node'da denenir.
+
+    # FIX 2: pcs resource defaults - RHEL9 pcs 0.11+ yeni syntax
+    # SORUN: "pcs resource defaults key=val" RHEL9'da çalışmıyor, silent fail oluyor
+    # ÇÖZÜM: "pcs resource defaults update key=val" kullanılmalı
+    # İki adım: önce yeni syntax dene, eski syntax'a fallback yap
+    - name: "PREP | Resource defaults ayarlanıyor (RHEL9 pcs 0.11+)"
+      command: >
+        pcs resource defaults update
+        resource-stickiness={{ resource_stickiness }}
+        migration-threshold={{ migration_threshold }}
+        failure-timeout=3600s
+      register: res_defaults_new
+      failed_when: false
+      changed_when: res_defaults_new.rc == 0
+      # failure-timeout=3600s: 3 hata → node dışla → 1 saat sonra hata sıfırla →
+      # resource tekrar o node'da denenebilir. Sonsuz dışlama önlenir.
+
+    - name: "PREP | Resource defaults ayarlanıyor (eski pcs fallback)"
+      command: >
+        pcs resource defaults
+        resource-stickiness={{ resource_stickiness }}
+        migration-threshold={{ migration_threshold }}
+        failure-timeout=3600s
+      register: res_defaults_old
+      when: res_defaults_new.rc != 0
+      failed_when: false
+      changed_when: res_defaults_old.rc is defined and res_defaults_old.rc == 0
+
+    # ---- STONITH: fence_ipmilan (her node için ayrı) ----------------------
+    - name: "STONITH | fence_ipmilan kaynakları oluşturuluyor"
+      block:
+        - name: "STONITH | fence kaynağı mevcut mu"
+          command: "pcs resource config fence_ipmi_{{ item }}"
+          register: fence_check
+          loop: "{{ groups['cluster_nodes'] }}"
+          changed_when: false
+          failed_when: false
+
+        # FIX (RHEL9 pcs 0.11+): 'action=' fence agent param hard error veriyor.
+        # pcs hata mesaji: "use 'pcmk_reboot_action' instead"
+        # Dogru: Pacemaker meta-attribute olarak 'meta pcmk_reboot_action=' verilmeli.
+        - name: "STONITH | fence_ipmilan kaynak oluştur"
+          command: >
+            pcs stonith create fence_ipmi_{{ item.item }}
+            fence_ipmilan
+            pcmk_host_check=static-list
+            pcmk_host_list={{ item.item }}
+            ip={{ hostvars[item.item].ipmi_ip }}
+            ipport={{ hostvars[item.item].ipmi_port }}
+            username={{ hostvars[item.item].ipmi_user }}
+            password={{ hostvars[item.item].ipmi_password }}
+            lanplus={{ hostvars[item.item].ipmi_lanplus | lower }}
+            pcmk_delay_base={{ '0s' if item.item == groups['cluster_nodes'][0] else '30s' }}
+            power_timeout=20
+            power_wait=3
+            pcmk_status_retries=6
+            plug={{ item.item }}
+            op monitor interval=60s timeout=60s
+            meta pcmk_reboot_action={{ stonith_action }}
+          loop: "{{ fence_check.results }}"
+          when: item.rc != 0
+          register: fence_create
+          failed_when:
+            - fence_create.rc != 0
+            - "'already exists' not in (fence_create.stderr | default(''))"
+
+        - name: "STONITH | Node kendini fence edemez (location constraint)"
+          command: >
+            pcs constraint location fence_ipmi_{{ item }}
+            avoids {{ item }}
+          loop: "{{ groups['cluster_nodes'] }}"
+          register: fence_loc
+          failed_when: fence_loc.rc != 0 and 'already exists' not in (fence_loc.stderr | default(''))
+          changed_when: fence_loc.rc == 0
+
+        - name: "RESULT | STONITH kaynakları hazır"
+          debug:
+            msg: "✓ fence_ipmilan STONITH kaynakları yapılandırıldı"
+      rescue:
+        - name: "ERROR | STONITH hata"
+          debug:
+            msg: |
+              ✗ HATA: STONITH kaynakları oluşturulamadı!
+              KONTROL:
+                pcs stonith
+                ipmitool -I lanplus -H <ipmi_ip> -U <user> -P <pass> chassis power status
+              Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}
+          failed_when: true
+
+    # ---- DLM ---------------------------------------------------------------
+    - name: "RESOURCE | DLM (controld) kaynağı"
+      block:
+        - name: "CHECK | dlm mevcut mu"
+          command: pcs resource config dlm
+          register: dlm_check
+          changed_when: false
+          failed_when: false
+
+        - name: "CREATE | dlm"
+          command: >
+            pcs resource create dlm ocf:pacemaker:controld
+            op monitor interval=30s timeout=30s on-fail=fence
+            op start timeout=90s
+            op stop timeout=100s
+          when: dlm_check.rc != 0
+
+        - name: "CLONE | dlm-clone"
+          command: >
+            pcs resource clone dlm
+            interleave=true ordered=true
+          when: dlm_check.rc != 0
+          register: dlm_clone_r
+          failed_when: dlm_clone_r.rc != 0 and 'already' not in (dlm_clone_r.stderr | default(''))
+
+        - name: "RESULT | DLM hazır"
+          debug:
+            msg: "✓ dlm-clone kaynağı {{ 'oluşturuldu' if dlm_check.rc != 0 else 'zaten mevcut' }}"
+      rescue:
+        - name: "ERROR | DLM hata"
+          debug:
+            msg: "✗ DLM kaynağı oluşturulamadı! Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}"
+          failed_when: true
+
+    # ---- lvmlockd ----------------------------------------------------------
+    - name: "RESOURCE | lvmlockd kaynağı"
+      block:
+        - name: "CHECK | lvmlockd mevcut mu"
+          command: pcs resource config lvmlockd
+          register: lvmlockd_check
+          changed_when: false
+          failed_when: false
+
+        - name: "CREATE | lvmlockd"
+          command: >
+            pcs resource create lvmlockd ocf:heartbeat:lvmlockd
+            op monitor interval=30s timeout=30s on-fail=fence
+            op start timeout=90s
+            op stop timeout=100s
+          when: lvmlockd_check.rc != 0
+
+        - name: "CLONE | lvmlockd-clone"
+          command: >
+            pcs resource clone lvmlockd
+            interleave=true ordered=true
+          when: lvmlockd_check.rc != 0
+          register: lvmlockd_clone_r
+          failed_when: lvmlockd_clone_r.rc != 0 and 'already' not in (lvmlockd_clone_r.stderr | default(''))
+
+        - name: "RESULT | lvmlockd hazır"
+          debug:
+            msg: "✓ lvmlockd-clone kaynağı {{ 'oluşturuldu' if lvmlockd_check.rc != 0 else 'zaten mevcut' }}"
+      rescue:
+        - name: "ERROR | lvmlockd hata"
+          debug:
+            msg: "✗ lvmlockd kaynağı oluşturulamadı! Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}"
+          failed_when: true
+
+    # ---- VIP ---------------------------------------------------------------
+    - name: "RESOURCE | Virtual IP kaynağı"
+      block:
+        - name: "CHECK | vip mevcut mu"
+          command: pcs resource config vip
+          register: vip_check
+          changed_when: false
+          failed_when: false
+
+        - name: "INFO | VIP NIC"
+          debug:
+            msg: "VIP NIC: {{ public_nic }} ({{ virtual_ip }}/{{ virtual_ip_cidr }})"
+          run_once: true
+
+        - name: "CREATE | vip"
+          command: >
+            pcs resource create vip ocf:heartbeat:IPaddr2
+            ip={{ virtual_ip }}
+            cidr_netmask={{ virtual_ip_cidr }}
+            nic={{ public_nic }}
+            op monitor interval=30s timeout=20s
+            op start timeout=60s
+            op stop timeout=60s
+          when: vip_check.rc != 0
+          run_once: true
+
+        - name: "RESULT | VIP hazır"
+          debug:
+            msg: "✓ vip kaynağı {{ 'oluşturuldu' if vip_check.rc != 0 else 'zaten mevcut' }} ({{ virtual_ip }}/{{ virtual_ip_cidr }}, nic={{ public_nic }})"
+
+        # Eğer VIP mevcut ama yanlış nic ile oluşturulduysa güncelle
+        # Mevcut VIP yanlış nic ile oluşturulmuşsa güncelle
+        - name: "UPDATE | VIP nic yanlışsa güncelle ({{ public_nic }})"
+          shell: |
+            pcs resource config vip 2>/dev/null | grep -q "nic={{ public_nic }}" && echo 'ok' || echo 'needs_update'
+          register: vip_nic_status
+          changed_when: false
+          failed_when: false
+          run_once: true
+
+        - name: "UPDATE | VIP nic={{ public_nic }} ile güncelleniyor"
+          command: pcs resource update vip nic={{ public_nic }}
+          when:
+            - vip_check.rc == 0
+            - vip_nic_status.stdout | trim == 'needs_update'
+          run_once: true
+          register: vip_nic_update
+          failed_when: false
+
+        - name: "INFO | VIP nic güncelleme sonucu"
+          debug:
+            msg: "{{ '✓ VIP nic=' + public_nic + ' olarak güncellendi' if (vip_nic_update is defined and vip_nic_update is changed) else 'ℹ VIP nic zaten doğru: ' + public_nic }}"
+          run_once: true
+
+        - name: "UPDATE | VIP failcount temizle"
+          command: pcs resource cleanup vip
+          when: vip_check.rc == 0
+          run_once: true
+          failed_when: false
+      rescue:
+        - name: "ERROR | VIP hata"
+          debug:
+            msg: "✗ VIP kaynağı oluşturulamadı! Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}"
+          failed_when: true
+
+    # ---- ORDER: dlm → lvmlockd ---------------------------------------------
+    - name: "CONSTRAINT | dlm → lvmlockd sıralaması"
+      command: >
+        pcs constraint order start dlm-clone
+        then lvmlockd-clone
+        id=order-dlm-lvmlockd
+      register: order_dlm
+      failed_when: order_dlm.rc != 0 and 'already exists' not in (order_dlm.stderr | default(''))
+      changed_when: order_dlm.rc == 0
+
+    # FIX: VIP için başlangıç node tercihi belirleniyor.
+    # PLAY 12 (initdb/postgresql.conf) groups['cluster_nodes'][0]'da çalışır.
+    # Eğer VIP farklı node'a atanırsa pgsql_fs orada mount olur, PLAY 12 bulamaz ve durur.
+    # Çözüm: VIP'i kurulum süresince clstr01'de tutmak için location kısıtlaması.
+    # Not: Bu "soft" tercih (INFINITY değil, 100) - failover'ı engellemez.
+    - name: "CONSTRAINT | VIP kurulum süresince ilk node'u tercih etsin"
+      command: >
+        pcs constraint location add loc-vip-prefer-node0
+        vip {{ groups['cluster_nodes'][0] }} 100
+      register: vip_loc
+      failed_when: vip_loc.rc != 0 and 'already exists' not in (vip_loc.stderr | default(''))
+      changed_when: vip_loc.rc == 0
+
+    - name: "VERIFY | Temel kaynak durumu"
+      command: pcs status
+      register: status_8c
+      changed_when: false
+      failed_when: false
+
+    - name: "RESULT | Temel kaynaklar"
+      debug:
+        msg: "{{ status_8c.stdout_lines }}"
+
+
+# =============================================================================
+# PLAY 9: LVM YAPILANDIRMASI
+# =============================================================================
+- name: "PLAY 9/13 | LVM ve Paylaşımlı Depolama Yapılandırması"
+  hosts: cluster_nodes
+  gather_facts: no
+  become: yes
+  any_errors_fatal: true
+
+  tasks:
+    # FIX: use_lvmlockd = 1 ayarı — lineinfile + regexp
+    # lvm.conf'ta ilgili satır yorum içinde şu formattadır:
+    #   # 	use_lvmlockd = 0
+    # regexp: satır başında isteğe bağlı boşluk/tab + isteğe bağlı '#' + boşluk/tab
+    #         + 'use_lvmlockd' + boşluk/= işareti kombinasyonu
+    # line: yorumsuz, doğru değerli satırla değiştirilir.
+    # backrefs: false — eşleşme yoksa satır sona eklenir (fallback güvencesi).
+    - name: "LVM | lvm.conf - locking_type satırını kaldır (eski parametre, çakışır)"
+      lineinfile:
+        path: /etc/lvm/lvm.conf
+        regexp: '^\s*#?\s*locking_type\s*='
+        state: absent
+
+    - name: "LVM | lvm.conf - use_lvmlockd = 1 yap (yorum veya 0 → aktif değer)"
+      lineinfile:
+        path: /etc/lvm/lvm.conf
+        regexp: '^\s*#?\s*use_lvmlockd\s*='
+        line: "\tuse_lvmlockd = 1"
+        backup: yes
+
+    - name: "LVM | lvm.conf doğrula"
+      shell: grep 'use_lvmlockd' /etc/lvm/lvm.conf | grep -v '^\s*#'
+      register: lvm_conf_verify
+      changed_when: false
+      failed_when: false
+
+    - name: "ASSERT | use_lvmlockd = 1 aktif olmalı"
+      assert:
+        that: "'use_lvmlockd = 1' in lvm_conf_verify.stdout"
+        success_msg: "✓ lvm.conf OK: {{ lvm_conf_verify.stdout | trim }}"
+        fail_msg: |
+          ✗ HATA: use_lvmlockd = 1 yazılamadı!
+          Mevcut (yorum dışı): {{ lvm_conf_verify.stdout }}
+          Manuel kontrol: grep use_lvmlockd /etc/lvm/lvm.conf
+
+    # Yapılması gereken: lvm.conf'u ayarla, paketi kur, cluster resource'un başlamasını bekle.
+    - name: "PACKAGE | lvm2-lockd paketi kurulu mu"
+      command: rpm -q lvm2-lockd
+      register: lvm2_lockd_pkg
+      changed_when: false
+      failed_when: false
+
+    - name: "PACKAGE | lvm2-lockd eksikse kur"
+      dnf:
+        name: lvm2-lockd
+        state: present
+      when: lvm2_lockd_pkg.rc != 0
+
+    - name: "SERVICE | lvmlockd.socket/service maskele (cluster yönetiyor)"
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: no
+        masked: yes
+      loop:
+        - lvm2-lvmlockd.service
+        - lvmlockd.service
+        - lvm2-lvmlockd.socket
+      failed_when: false
+
+    - name: "INFO | lvmlockd systemd servisi maskelendi"
+      debug:
+        msg: "✓ lvmlockd systemd birimi maskelendi — lvmlockd-clone cluster resource tarafından başlatılacak"
+
+    - name: "LVM | DLM cluster kaynağının başlamasını bekleniyor"
+      command: pcs resource status dlm-clone
+      register: dlm_status_wait
+      retries: 15
+      delay: 10
+      until: "'Started' in dlm_status_wait.stdout or 'running' in dlm_status_wait.stdout"
+      changed_when: false
+      failed_when: false
+      run_once: true
+      delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+    - name: "LVM | lvmlockd cluster kaynağının başlamasını bekleniyor"
+      command: pcs resource status lvmlockd-clone
+      register: lvmlockd_status_wait
+      retries: 15
+      delay: 10
+      until: "'Started' in lvmlockd_status_wait.stdout or 'running' in lvmlockd_status_wait.stdout"
+      changed_when: false
+      failed_when: false
+      run_once: true
+      delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+    - name: "INFO | DLM ve lvmlockd durumu"
+      debug:
+        msg: "✓ DLM ve lvmlockd kaynakları aktif - LVM yapılandırmasına devam"
+      run_once: true
+
+    # ---- PV + VG + LV (sadece node0'da oluşturulur) -----------------------
+    - name: "LVM | Paylaşımlı VG yapılandırması (sadece ilk node'da)"
+      block:
+        - name: "LVM | Physical Volume kontrolü"
+          command: "pvdisplay {{ shared_disk }}"
+          register: pv_exists
+          changed_when: false
+          failed_when: false
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "LVM | Physical Volume oluştur"
+          command: "pvcreate -ff {{ shared_disk|trim }}"
+          register: pvcreate_result
+          failed_when:
+            - pvcreate_result.rc != 0
+            - "'already exists' not in pvcreate_result.stderr"
+            - "'already a physical volume' not in pvcreate_result.stderr"
+          changed_when: "'successfully created' in pvcreate_result.stdout"
+          when: pv_exists.rc != 0
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "PV | Oluşturma sonucu"
+          debug:
+            msg: "✓ Physical Volume: {{ shared_disk }}"
+          run_once: true
+
+        # VG varlık kontrolü: pvdisplay ile PV'nin hangi VG'ye atandığını kontrol et.
+        # 'vgs --nolocking' güvenilmez: VG mevcutsa ama lockspace başlatılmamışsa yine rc=5.
+        - name: "LVM | Volume Group kontrolü"
+          shell: "pvdisplay {{ shared_disk }} 2>/dev/null | grep -q 'VG Name.*{{ shared_vg }}'"
+          register: vg_exists
+          changed_when: false
+          failed_when: false
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "LVM | Paylaşımlı VG oluştur (--shared)"
+          command: "vgcreate --shared {{ shared_vg }} {{ shared_disk|trim }}"
+          register: vgcreate_result
+          failed_when:
+            - vgcreate_result.rc != 0
+            - "'already exists' not in vgcreate_result.stderr"
+          changed_when: "'successfully created' in vgcreate_result.stdout"
+          when: vg_exists.rc != 0
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "VG | Oluşturma sonucu"
+          debug:
+            msg: "✓ Volume Group: {{ shared_vg }}"
+          run_once: true
+
+        - name: "LVM | pvscan --cache (spesifik disk)"
+          command: "pvscan --cache {{ shared_disk }}"
+          changed_when: false
+          failed_when: false
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "LVM | vgscan (cache güncelle)"
+          command: vgscan
+          changed_when: false
+          failed_when: false
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        # KÖK NEDEN: vg_lock_type=dlm VG'ler lockspace START edilmeden vgs ile
+        # görülmüyor. --nolocking da çözmüyor. Doğru sıra:
+        # vgcreate --shared -> vgchange --lock-start -> vgs (normal)
+        # lock-start idempotent: zaten aktifse zararsız.
+        - name: "LVM | Lock-start durumu kontrol et"
+          command: "lvmlockctl --dump"
+          register: lockctl_dump
+          changed_when: false
+          failed_when: false
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "LVM | VG lock-start (doğrulamadan önce — zorunlu)"
+          command: "vgchange --lock-start {{ shared_vg }}"
+          register: lockstart_result
+          changed_when: false
+          failed_when: false
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "INFO | VG lock-start durumu"
+          debug:
+            msg: "lock-start rc={{ lockstart_result.rc }} {{ lockstart_result.stdout | default('') }} {{ lockstart_result.stderr | default('') }}"
+          run_once: true
+
+        - name: "LVM | VG erişilebilir mi doğrula (lockspace aktif, normal vgs)"
+          command: "vgs {{ shared_vg }}"
+          register: vg_verify
+          retries: 6
+          delay: 5
+          until: vg_verify.rc == 0
+          changed_when: false
+          failed_when: vg_verify.rc != 0
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "LVM | GFS2 LV kontrolü"
+          command: "lvdisplay /dev/{{ shared_vg }}/{{ gfs2_lv }}"
+          register: gfs2_lv_exists
+          changed_when: false
+          failed_when: false
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "LVM | GFS2 Logical Volume oluştur"
+          command: "lvcreate -L {{ gfs2_lv_size }} -n {{ gfs2_lv }} {{ shared_vg }}"
+          register: lvcreate_gfs2
+          failed_when:
+            - lvcreate_gfs2.rc != 0
+            - "'already exists' not in lvcreate_gfs2.stderr"
+          changed_when: "'Logical volume' in lvcreate_gfs2.stdout"
+          when: gfs2_lv_exists.rc != 0
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "GFS2 LV | Sonuç"
+          debug:
+            msg: "✓ GFS2 LV: /dev/{{ shared_vg }}/{{ gfs2_lv }} ({{ gfs2_lv_size }})"
+          run_once: true
+
+        - name: "LVM | GFS2 LV özet"
+          command: "lvs {{ shared_vg }}"
+          register: lvs_gfs2_output
+          changed_when: false
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "INFO | GFS2 LV"
+          debug:
+            msg: "✓ GFS2 LV hazır:\n{{ lvs_gfs2_output.stdout }}"
+          run_once: true
+      rescue:
+        - name: "ERROR | GFS2 VG/LV hata"
+          debug:
+            msg: |
+              ✗ HATA: GFS2 LVM yapılandırması başarısız!
+              ÇÖZÜM:
+                pvs; vgs; lvs
+                vgdisplay {{ shared_vg }}
+                lsblk {{ shared_disk }}
+                Temizlik: vgremove -f {{ shared_vg }} && pvremove {{ shared_disk }}
+              Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}
+          failed_when: true
+
+    # =========================================================================
+    # PostgreSQL - AYRI DİSK (db_disk=/dev/sdc), AYRI VG (db_vg)
+    # Exclusive access - pgsql_lv_activate resource (non-clone) yönetir
+    # =========================================================================
+    - name: "LVM | PostgreSQL VG+LV yapılandırması ({{ db_disk }} → {{ db_vg }})"
+      block:
+        - name: "LVM | PostgreSQL PV kontrolü"
+          command: "pvdisplay {{ db_disk }}"
+          register: db_pv_exists
+          changed_when: false
+          failed_when: false
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "LVM | PostgreSQL Physical Volume oluştur"
+          command: "pvcreate -ff {{ db_disk|trim }}"
+          when: db_pv_exists.rc != 0
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        # VG varlık kontrolü: pvdisplay ile PV'nin VG'ye atandığını kontrol et.
+        - name: "LVM | PostgreSQL VG kontrolü"
+          shell: "pvdisplay {{ db_disk }} 2>/dev/null | grep -q 'VG Name.*{{ db_vg }}'"
+          register: db_vg_exists
+          changed_when: false
+          failed_when: false
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "LVM | PostgreSQL VG oluştur (--shared, lvmlockd)"
+          command: "vgcreate --shared {{ db_vg }} {{ db_disk|trim }}"
+          register: db_vgcreate_result
+          failed_when:
+            - db_vgcreate_result.rc != 0
+            - "'already exists' not in db_vgcreate_result.stderr"
+          changed_when: "'successfully created' in db_vgcreate_result.stdout"
+          when: db_vg_exists.rc != 0
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "LVM | pvscan/vgscan cache (db_vg için)"
+          command: "{{ item }}"
+          loop:
+            - pvscan --cache
+            - vgscan
+          changed_when: false
+          failed_when: false
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "LVM | pvscan --cache (PostgreSQL disk)"
+          command: "pvscan --cache {{ db_disk }}"
+          changed_when: false
+          failed_when: false
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        # KÖK NEDEN: db_vg de vg_lock_type=dlm — lock-start ÖNCE, verify SONRA.
+        - name: "LVM | db_vg lock-start (doğrulamadan önce — zorunlu)"
+          command: "vgchange --lock-start {{ db_vg }}"
+          register: db_lockstart_result
+          changed_when: false
+          failed_when: false
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "INFO | db_vg lock durumu"
+          debug:
+            msg: "lock-start rc={{ db_lockstart_result.rc }} {{ db_lockstart_result.stdout | default('') }} {{ db_lockstart_result.stderr | default('') }}"
+          run_once: true
+
+        - name: "LVM | db_vg erişilebilir mi doğrula (lockspace aktif, normal vgs)"
+          command: "vgs {{ db_vg }}"
+          register: db_vg_verify
+          retries: 6
+          delay: 5
+          until: db_vg_verify.rc == 0
+          changed_when: false
+          failed_when: db_vg_verify.rc != 0
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "LVM | PostgreSQL LV kontrolü"
+          command: "lvdisplay /dev/{{ db_vg }}/{{ pgsql_lv }}"
+          register: pgsql_lv_exists
+          changed_when: false
+          failed_when: false
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "LVM | PostgreSQL Logical Volume oluştur"
+          command: "lvcreate -L {{ pgsql_lv_size }} -n {{ pgsql_lv }} {{ db_vg }}"
+          register: lvcreate_pgsql
+          failed_when:
+            - lvcreate_pgsql.rc != 0
+            - "'already exists' not in lvcreate_pgsql.stderr"
+          changed_when: "'Logical volume' in lvcreate_pgsql.stdout"
+          when: pgsql_lv_exists.rc != 0
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "LVM | PostgreSQL LV özet"
+          command: "lvs {{ db_vg }}"
+          register: lvs_db_output
+          changed_when: false
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "INFO | PostgreSQL LV"
+          debug:
+            msg: "✓ PostgreSQL LV hazır:\n{{ lvs_db_output.stdout }}"
+          run_once: true
+      rescue:
+        - name: "ERROR | PostgreSQL VG/LV hata"
+          debug:
+            msg: |
+              ✗ HATA: PostgreSQL LVM yapılandırması başarısız!
+              ÇÖZÜM:
+                pvs; vgs; lvs
+                vgdisplay {{ db_vg }}
+                lsblk {{ db_disk }}
+                Temizlik: vgremove -f {{ db_vg }} && pvremove {{ db_disk }}
+              Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}
+          failed_when: true
+
+    # FIX: use_lvmlockd=1 aktifken lvchange -ay -K yeterli değil.
+    # -K sadece cluster lock'u atlar; lvmlockd daemon lock'u hâlâ gereklidir.
+    # Çözüm: mkfs için --config override ile lvmlockd'yi geçici devre dışı bırak.
+    # Bu sadece başlangıç formatlaması içindir; sonra cluster resource yönetir.
+    - name: "LVM | GFS2 LV exclusive aktivasyon (lvmlockd bypass, mkfs için)"
+      shell: >
+        lvchange -aey --nolocking
+        /dev/{{ shared_vg }}/{{ gfs2_lv }}
+      register: gfs2_lv_activate_local
+      changed_when: false
+      failed_when:
+        - gfs2_lv_activate_local.rc != 0
+        - "'already active' not in (gfs2_lv_activate_local.stderr | default(''))"
+      run_once: true
+      delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+    - name: "LVM | PostgreSQL LV exclusive aktivasyon (lvmlockd bypass, db_vg)"
+      shell: >
+        lvchange -aey --nolocking
+        /dev/{{ db_vg }}/{{ pgsql_lv }}
+      register: pgsql_lv_activate_local
+      changed_when: false
+      failed_when:
+        - pgsql_lv_activate_local.rc != 0
+        - "'already active' not in (pgsql_lv_activate_local.stderr | default(''))"
+      run_once: true
+      delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+    - name: "LVM | udev settle - device node'larının oluşmasını bekle"
+      command: udevadm settle --timeout=30
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+    - name: "LVM | LV device dosyaları doğrulanıyor"
+      shell: |
+        for dev in /dev/{{ shared_vg }}/{{ gfs2_lv }} /dev/{{ db_vg }}/{{ pgsql_lv }}; do
+          if [ ! -b "$dev" ]; then
+            echo "MISSING: $dev"
+          else
+            echo "OK: $dev -> $(readlink -f $dev)"
+          fi
+        done
+      register: lv_device_check
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+    - name: "ASSERT | LV device dosyaları mevcut olmalı"
+      assert:
+        that:
+          - "'MISSING' not in lv_device_check.stdout"
+        success_msg: "✓ LV device dosyaları hazır:\n{{ lv_device_check.stdout }}"
+        fail_msg: |
+          ✗ HATA: LV device dosyaları oluşmadı!
+          {{ lv_device_check.stdout }}
+          ÇÖZÜM:
+            lvs {{ shared_vg }}; lvs {{ db_vg }}
+            dmsetup ls
+            lvchange -aey --nolocking /dev/{{ shared_vg }}/{{ gfs2_lv }}
+            lvchange -aey --nolocking /dev/{{ db_vg }}/{{ pgsql_lv }}
+      run_once: true
+      delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+    # FIX: Filesystem varlığını ayrı değişkenle tespit ediyoruz
+    - name: "LVM | GFS2 filesystem kontrolü"
+      command: "blkid /dev/{{ shared_vg }}/{{ gfs2_lv }}"
+      register: gfs2_blkid_check
+      changed_when: false
+      failed_when: false
+      run_once: true
+      delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+    - name: "LVM | GFS2 filesystem oluşturuluyor"
+      block:
+        - name: "GFS2 | mkfs.gfs2"
+          command: >
+            mkfs.gfs2
+            -j {{ gfs2_journals }}
+            -p lock_dlm
+            -t {{ cluster_name }}:{{ gfs2_lock_table }}
+            -O
+            /dev/{{ shared_vg }}/{{ gfs2_lv }}
+          when: gfs2_blkid_check.rc != 0 or 'gfs2' not in gfs2_blkid_check.stdout
+          register: mkfs_gfs2_result
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        # KÖK NEDEN: mkfs için lvchange -aey (exclusive) ile aktive ettik.
+        # Eğer burada deaktive etmezsek, Pacemaker clstr02'de activation_mode=shared
+        # ile aktive etmeye çalışırken "LV locked by other host" alır.
+        # Çözüm: mkfs bitti → hemen deaktive et → Pacemaker her iki node'da
+        # shared modda aktive eder.
+        - name: "GFS2 | LV deaktive et (mkfs bitti, Pacemaker devralacak)"
+          command: "lvchange -an --nolocking /dev/{{ shared_vg }}/{{ gfs2_lv }}"
+          register: gfs2_deactivate
+          changed_when: false
+          failed_when:
+            - gfs2_deactivate.rc != 0
+            - "'not active' not in (gfs2_deactivate.stderr | default(''))"
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "GFS2 | Filesystem oluşturuldu"
+          debug:
+            msg: "✓ GFS2 filesystem oluşturuldu: /dev/{{ shared_vg }}/{{ gfs2_lv }}"
+          when: mkfs_gfs2_result is defined and mkfs_gfs2_result is changed
+          run_once: true
+
+        - name: "GFS2 | Filesystem zaten mevcut"
+          debug:
+            msg: "✓ GFS2 filesystem zaten mevcut, atlanıyor"
+          when: gfs2_blkid_check.rc == 0 and 'gfs2' in gfs2_blkid_check.stdout
+          run_once: true
+      rescue:
+        - name: "ERROR | GFS2 hata"
+          debug:
+            msg: |
+              ✗ HATA: GFS2 filesystem oluşturulamadı!
+              ÇÖZÜM:
+                1. DLM çalışıyor mu: pcs resource status dlm-clone
+                2. lvmlockd çalışıyor mu: pcs resource status lvmlockd-clone
+                3. LV mevcut mu: lvdisplay /dev/{{ shared_vg }}/{{ gfs2_lv }}
+                4. Manuel:
+                   mkfs.gfs2 -j{{ gfs2_journals }} -p lock_dlm -t {{ cluster_name }}:{{ gfs2_lock_table }} -O /dev/{{ shared_vg }}/{{ gfs2_lv }}
+              Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}
+          failed_when: true
+
+    - name: "LVM | PostgreSQL XFS filesystem kontrolü"
+      command: "blkid /dev/{{ db_vg }}/{{ pgsql_lv }}"
+      register: pgsql_blkid_check
+      changed_when: false
+      failed_when: false
+      run_once: true
+      delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+    - name: "LVM | PostgreSQL XFS filesystem"
+      block:
+        # XFS: PostgreSQL için önerilen dosya sistemi.
+        # ext4'e göre avantajları: daha iyi büyük dosya performansı, daha hızlı fsck,
+        # daha iyi paralel I/O, delay allocation ile write performansı.
+        # mkfs.xfs seçenekleri:
+        #   -L pgsql_data  : volume label
+        #   -f             : mevcut imzayı zorla (idempotent çalışma için)
+        - name: "xfs | mkfs.xfs"
+          command: >
+            mkfs.xfs -L pgsql_data -f
+            /dev/{{ db_vg }}/{{ pgsql_lv }}
+          when: pgsql_blkid_check.rc != 0 or 'xfs' not in pgsql_blkid_check.stdout
+          register: mkfs_xfs_result
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "xfs | PostgreSQL LV deaktive et (Pacemaker devralacak)"
+          command: "lvchange -an --nolocking /dev/{{ db_vg }}/{{ pgsql_lv }}"
+          register: pgsql_deactivate
+          changed_when: false
+          failed_when:
+            - pgsql_deactivate.rc != 0
+            - "'not active' not in (pgsql_deactivate.stderr | default(''))"
+          run_once: true
+          delegate_to: "{{ groups['cluster_nodes'][0] }}"
+
+        - name: "xfs | Filesystem hazır"
+          debug:
+            msg: "✓ XFS filesystem hazır: /dev/{{ db_vg }}/{{ pgsql_lv }}"
+          run_once: true
+      rescue:
+        - name: "ERROR | xfs hata"
+          debug:
+            msg: |
+              ✗ HATA: PostgreSQL XFS filesystem oluşturulamadı!
+              ÇÖZÜM: mkfs.xfs -L pgsql_data -f /dev/{{ db_vg }}/{{ pgsql_lv }}
+              Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}
+          failed_when: true
+
+    # =========================================================================
+    # KÖK NEDEN ANALİZİ:
+    # Race condition: cleanup (run_once, clstr01'den) her iki node'un lock-start'ı
+    # tamamlamasını beklemeden çalışıyor. Pacemaker clstr02'de lockspace hazır
+    # değilken gfs2_lv_activate başlatmaya çalışıyor → "failed to activate".
+    #
+    # DOĞRU SIRA:
+    #   1. Her node'da lvmlockd process'i doğrula (per-node)
+    #   2. Her node'da lock-start çalıştır — retry ile, failed_when: rc != 0
+    #   3. Her node'da VG erişimini doğrula — retry ile (barrier/sync noktası)
+    #   4. Tüm nodelar hazır OLDUKTAN SONRA cleanup (run_once)
+    #   5. WAIT — her iki node'da Started görünene kadar
+    # =========================================================================
+
+    - name: "VG | Bu node'da lvmlockd process çalışıyor mu (per-node)"
+      command: "pgrep -x lvmlockd"
+      register: lvmlockd_proc
+      retries: 20
+      delay: 5
+      until: lvmlockd_proc.rc == 0
+      changed_when: false
+      failed_when: lvmlockd_proc.rc != 0
+
+    - name: "VG | DLM lockspace hazır mı (per-node)"
+      shell: "dlm_tool ls 2>/dev/null | grep -q dlm || dlm_tool status 2>/dev/null | grep -q 'daemon up'"
+      register: dlm_ready
+      retries: 20
+      delay: 5
+      until: dlm_ready.rc == 0
+      changed_when: false
+      failed_when: false
+
+    - name: "VG | LVM cache güncelle (her node)"
+      shell: |
+        pvscan --cache {{ shared_disk }} 2>/dev/null || true
+        pvscan --cache {{ db_disk }} 2>/dev/null || true
+        vgscan 2>/dev/null || true
+      changed_when: false
+      failed_when: false
+
+    # lock-start idempotent: zaten aktifse başarıyla döner.
+    # failed_when ile silent-fail kaldırıldı — gerçek hata görülür.
+    - name: "VG | GFS2 VG lock-start (her node) — retry ile"
+      command: "vgchange --lock-start {{ shared_vg }}"
+      register: vg_lockstart_gfs2
+      retries: 10
+      delay: 5
+      until: vg_lockstart_gfs2.rc == 0
+      changed_when: false
+      failed_when: vg_lockstart_gfs2.rc != 0
+
+    - name: "VG | PostgreSQL VG lock-start (her node) — retry ile"
+      command: "vgchange --lock-start {{ db_vg }}"
+      register: vg_lockstart_db
+      retries: 10
+      delay: 5
+      until: vg_lockstart_db.rc == 0
+      changed_when: false
+      failed_when: vg_lockstart_db.rc != 0
+
+    - name: "RESULT | VG lock-start durumu"
+      debug:
+        msg: |
+          {{ inventory_hostname }}:
+            GFS2 VG  ({{ shared_vg }}): ✓ lock-start OK
+            Pgsql VG ({{ db_vg }}): ✓ lock-start OK
+
+    # BARRIER: Her node bu noktaya geldiğinde VG erişimini doğrula.
+    # Cleanup ancak tüm nodelar bu adımı geçtikten sonra çalışır.
+    - name: "VG | GFS2 VG erişimi doğrula — tüm nodelar hazır olana kadar bekle"
+      command: "vgs {{ shared_vg }}"
+      register: vg_barrier
+      retries: 10
+      delay: 5
+      until: vg_barrier.rc == 0
+      changed_when: false
+      failed_when: vg_barrier.rc != 0
+
+    - name: "VG | GFS2 LV metadata görünür mü (per-node)"
+      command: "lvs /dev/{{ shared_vg }}/{{ gfs2_lv }}"
+      register: lv_visible
+      changed_when: false
+      failed_when: false
+
+    - name: "RESULT | Her node LV durumu"
+      debug:
+        msg: "{{ inventory_hostname }}: {{ '✓ LV görünür' if lv_visible.rc == 0 else '⚠ LV metadata henüz görünmüyor (Pacemaker aktive edecek)' }}"
+
+    # PLAY 9 tamamlandı. Resource OLUŞTURMA PLAY 11'de yapılır.
+    # CLEANUP ve WAIT, resource creation'dan SONRA PLAY 11'de çalışır.
+
+
+# =============================================================================
+# PLAY 10: MOUNT NOKTALARI
+# =============================================================================
+- name: "PLAY 10/13 | Mount Noktaları Oluşturma"
+  hosts: cluster_nodes
+  gather_facts: no
+  become: yes
+
+  tasks:
+    - name: "MOUNT | GFS2 mount noktası"
+      file:
+        path: "{{ gfs2_mount }}"
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: "MOUNT | postgres kullanıcısı mevcut mu"
+      command: id postgres
+      register: postgres_user_check
+      changed_when: false
+      failed_when: false
+
+    - name: "MOUNT | PostgreSQL mount noktası"
+      file:
+        path: "{{ pgsql_mount }}"
+        state: directory
+        mode: '0700'
+        owner: "{{ 'postgres' if postgres_user_check.rc == 0 else 'root' }}"
+        group: "{{ 'postgres' if postgres_user_check.rc == 0 else 'root' }}"
+
+    - name: "RESULT | Mount noktaları hazır"
+      debug:
+        msg: |
+          ✓ Mount noktaları:
+            GFS2      : {{ gfs2_mount }}
+            PostgreSQL: {{ pgsql_mount }}
+
+
+# =============================================================================
+# PLAY 11: CLUSTER KAYNAKLARI
+# =============================================================================
+- name: "PLAY 11/13 | Cluster Kaynakları Yapılandırması"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+  any_errors_fatal: true
+
+  tasks:
+    - name: "RESOURCE | Cluster sabitlenene kadar bekleniyor"
+      command: pcs status
+      register: cluster_pre_status
+      changed_when: false
+      retries: 12
+      delay: 10
+      until: cluster_pre_status.rc == 0
+
+    - name: "INFO | Mevcut cluster durumu"
+      debug:
+        msg: "{{ cluster_pre_status.stdout_lines }}"
+
+    # FIX: pcs resource show → pcs resource config (RHEL9 pcs 0.10/0.11 uyumlu)
+    # Eski hata: Bazı RHEL9 pcs versiyonlarında "show" deprecated veya farklı çıktı veriyordu.
+
+    # ---- GFS2 LV Activate --------------------------------------------------
+    - name: "RESOURCE | GFS2 LVM-activate kaynağı"
+      block:
+        - name: "CHECK | gfs2_lv_activate mevcut mu"
+          command: pcs resource config gfs2_lv_activate
+          register: gfs2_lv_res_check
+          changed_when: false
+          failed_when: false
+
+        - name: "CREATE | gfs2_lv_activate"
+          command: >
+            pcs resource create gfs2_lv_activate ocf:heartbeat:LVM-activate
+            vgname={{ shared_vg }}
+            lvname={{ gfs2_lv }}
+            vg_access_mode=lvmlockd
+            activation_mode=shared
+            op monitor interval={{ resource_monitor_interval }} timeout=30s on-fail=fence
+            op start timeout={{ resource_start_timeout }}
+            op stop timeout={{ resource_stop_timeout }}
+          when: gfs2_lv_res_check.rc != 0
+
+        - name: "CLONE | gfs2_lv_activate-clone"
+          command: >
+            pcs resource clone gfs2_lv_activate
+            interleave=true
+          when: gfs2_lv_res_check.rc != 0
+          register: gfs2_lv_clone_result
+          failed_when:
+            - gfs2_lv_clone_result.rc != 0
+            - "'already exists' not in gfs2_lv_clone_result.stderr | default('')"
+
+        - name: "RESULT | gfs2_lv_activate hazır"
+          debug:
+            msg: "✓ gfs2_lv_activate kaynağı {{ 'oluşturuldu' if gfs2_lv_res_check.rc != 0 else 'zaten mevcut' }}"
+      rescue:
+        - name: "ERROR | gfs2_lv_activate hatası"
+          debug:
+            msg: |
+              ✗ HATA: gfs2_lv_activate kaynağı oluşturulamadı!
+              ÇÖZÜM:
+                pcs resource create gfs2_lv_activate ocf:heartbeat:LVM-activate \
+                  vgname={{ shared_vg }} lvname={{ gfs2_lv }} \
+                  vg_access_mode=lvmlockd activation_mode=shared
+              Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}
+          failed_when: true
+
+    # ---- GFS2 Filesystem ---------------------------------------------------
+    - name: "RESOURCE | GFS2 Filesystem kaynağı"
+      block:
+        - name: "CHECK | gfs2_fs mevcut mu"
+          command: pcs resource config gfs2_fs
+          register: gfs2_fs_res_check
+          changed_when: false
+          failed_when: false
+
+        - name: "CREATE | gfs2_fs"
+          command: >
+            pcs resource create gfs2_fs ocf:heartbeat:Filesystem
+            device="/dev/{{ shared_vg }}/{{ gfs2_lv }}"
+            directory="{{ gfs2_mount }}"
+            fstype=gfs2
+            options="noatime,nodiratime"
+            op monitor interval={{ resource_monitor_interval }} timeout=40s on-fail=fence
+            op start timeout={{ resource_start_timeout }}
+            op stop timeout={{ resource_stop_timeout }}
+          when: gfs2_fs_res_check.rc != 0
+
+        - name: "CLONE | gfs2_fs-clone"
+          command: >
+            pcs resource clone gfs2_fs
+            interleave=true
+          when: gfs2_fs_res_check.rc != 0
+          register: gfs2_fs_clone_result
+          failed_when:
+            - gfs2_fs_clone_result.rc != 0
+            - "'already exists' not in gfs2_fs_clone_result.stderr | default('')"
+
+        - name: "RESULT | gfs2_fs hazır"
+          debug:
+            msg: "✓ gfs2_fs kaynağı {{ 'oluşturuldu' if gfs2_fs_res_check.rc != 0 else 'zaten mevcut' }} ({{ gfs2_mount }})"
+      rescue:
+        - name: "ERROR | gfs2_fs hatası"
+          debug:
+            msg: |
+              ✗ HATA: gfs2_fs kaynağı oluşturulamadı!
+              ÇÖZÜM: pcs resource create gfs2_fs ocf:heartbeat:Filesystem \
+                device=/dev/{{ shared_vg }}/{{ gfs2_lv }} directory={{ gfs2_mount }} fstype=gfs2
+              Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}
+          failed_when: true
+
+    # ---- PostgreSQL LV Activate (Exclusive) --------------------------------
+    - name: "RESOURCE | PostgreSQL LVM-activate kaynağı (Exclusive)"
+      block:
+        - name: "CHECK | pgsql_lv_activate mevcut mu"
+          command: pcs resource config pgsql_lv_activate
+          register: pgsql_lv_res_check
+          changed_when: false
+          failed_when: false
+
+        - name: "CREATE | pgsql_lv_activate"
+          command: >
+            pcs resource create pgsql_lv_activate ocf:heartbeat:LVM-activate
+            vgname={{ db_vg }}
+            lvname={{ pgsql_lv }}
+            vg_access_mode=lvmlockd
+            activation_mode=exclusive
+            op monitor interval={{ resource_monitor_interval }} timeout=30s on-fail=fence
+            op start timeout={{ resource_start_timeout }}
+            op stop timeout={{ resource_stop_timeout }}
+          when: pgsql_lv_res_check.rc != 0
+
+        - name: "RESULT | pgsql_lv_activate hazır"
+          debug:
+            msg: "✓ pgsql_lv_activate kaynağı hazır (Exclusive - sadece aktif node'da)"
+      rescue:
+        - name: "ERROR | pgsql_lv_activate hatası"
+          debug:
+            msg: |
+              ✗ HATA: pgsql_lv_activate kaynağı oluşturulamadı!
+              NOT: Bu kaynak CLONE EDİLMEZ - sadece 1 node'da aktif
+              Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}
+          failed_when: true
+
+    # ---- PostgreSQL Filesystem ---------------------------------------------
+    - name: "RESOURCE | PostgreSQL Filesystem kaynağı"
+      block:
+        - name: "CHECK | pgsql_fs mevcut mu"
+          command: pcs resource config pgsql_fs
+          register: pgsql_fs_res_check
+          changed_when: false
+          failed_when: false
+
+        - name: "CREATE | pgsql_fs"
+          command: >
+            pcs resource create pgsql_fs ocf:heartbeat:Filesystem
+            device="/dev/{{ db_vg }}/{{ pgsql_lv }}"
+            directory="{{ pgsql_mount }}"
+            fstype=xfs
+            options="noatime,nodiratime,inode64,logbufs=8,allocsize=64m"
+            op monitor interval={{ resource_monitor_interval }} timeout=40s on-fail=fence
+            op start timeout={{ resource_start_timeout }} on-fail=fence
+            op stop timeout={{ resource_stop_timeout }} on-fail=block
+            meta failure-timeout=3600s
+          when: pgsql_fs_res_check.rc != 0
+
+        - name: "RESULT | pgsql_fs hazır"
+          debug:
+            msg: "✓ pgsql_fs kaynağı hazır ({{ pgsql_mount }} - sadece aktif node'da)"
+      rescue:
+        - name: "ERROR | pgsql_fs hatası"
+          debug:
+            msg: |
+              ✗ HATA: pgsql_fs kaynağı oluşturulamadı!
+              NOT: Bu kaynak CLONE EDİLMEZ - sadece aktif node'da mount
+              Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}
+          failed_when: true
+
+    # ---- Order Constraints -------------------------------------------------
+    - name: "CONSTRAINT | Kaynak sıralama kuralları"
+      block:
+        - name: "ORDER | lvmlockd → gfs2_lv_activate"
+          command: >
+            pcs constraint order start lvmlockd-clone
+            then gfs2_lv_activate-clone
+            id=order-lvmlockd-gfs2lv
+          register: c1
+          failed_when: c1.rc != 0 and 'already exists' not in (c1.stderr | default(''))
+          changed_when: c1.rc == 0
+
+        - name: "ORDER | gfs2_lv_activate → gfs2_fs"
+          command: >
+            pcs constraint order start gfs2_lv_activate-clone
+            then gfs2_fs-clone
+            id=order-gfs2lv-gfs2fs
+          register: c2
+          failed_when: c2.rc != 0 and 'already exists' not in (c2.stderr | default(''))
+          changed_when: c2.rc == 0
+
+        - name: "ORDER | lvmlockd → pgsql_lv_activate"
+          command: >
+            pcs constraint order start lvmlockd-clone
+            then pgsql_lv_activate
+            id=order-lvmlockd-psqllv
+          register: c3
+          failed_when: c3.rc != 0 and 'already exists' not in (c3.stderr | default(''))
+          changed_when: c3.rc == 0
+
+        - name: "ORDER | pgsql_lv_activate → pgsql_fs"
+          command: >
+            pcs constraint order start pgsql_lv_activate
+            then pgsql_fs
+            id=order-psqllv-psqlfs
+          register: c4
+          failed_when: c4.rc != 0 and 'already exists' not in (c4.stderr | default(''))
+          changed_when: c4.rc == 0
+
+        - name: "RESULT | Sıralama kuralları tamamlandı"
+          debug:
+            msg: "✓ Kaynak sıralama kuralları yapılandırıldı (pgsql_fs → postgresql PLAY 12'de eklenecek)"
+      rescue:
+        - name: "WARN | Constraint ekleme uyarısı"
+          debug:
+            msg: |
+              ⚠ UYARI: Bazı constraint'ler eklenemedi (zaten mevcut olabilir)
+              KONTROL: pcs constraint show --full
+              Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}
+
+    # ---- Colocation Constraints (PostgreSQL grubu VIP zinciri) ---
+    # Zincir: postgresql ↔ pgsql_fs ↔ pgsql_lv_activate ↔ vip
+    # Bu 4 resource'un kesinlikle aynı node'da çalışmasını garanti eder.
+    # postgresql constraint'i PLAY 12'de eklenir (resource orada oluşturuluyor).
+    - name: "CONSTRAINT | Colocation zinciri (pgsql grubu)"
+      block:
+        # pgsql_lv_activate neredeyse vip orada
+        - name: "COLOCATION | pgsql_lv_activate ile vip"
+          command: >
+            pcs constraint colocation add pgsql_lv_activate with vip INFINITY
+            id=colo-psqllv-vip
+          register: col1
+          failed_when: col1.rc != 0 and 'already exists' not in (col1.stderr | default(''))
+          changed_when: col1.rc == 0
+
+        # pgsql_fs neredeyse pgsql_lv_activate orada
+        - name: "COLOCATION | pgsql_fs ile pgsql_lv_activate"
+          command: >
+            pcs constraint colocation add pgsql_fs with pgsql_lv_activate INFINITY
+            id=colo-psqlfs-psqllv
+          register: col2
+          failed_when: col2.rc != 0 and 'already exists' not in (col2.stderr | default(''))
+          changed_when: col2.rc == 0
+
+        - name: "RESULT | Colocation zinciri tamamlandı"
+          debug:
+            msg: "✓ pgsql_lv_activate↔vip, pgsql_fs↔pgsql_lv_activate colocation'ları eklendi"
+      rescue:
+        - name: "WARN | Colocation uyarısı"
+          debug:
+            msg: |
+              ⚠ UYARI: Colocation kuralları eklenirken sorun oluştu
+              KONTROL: pcs constraint show --full
+              Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}
+
+    # =========================================================================
+    # CLEANUP + WAIT — resource'lar ARTIK MEVCUT (bu play oluşturdu)
+    # Pacemaker ilk aktivasyon sırasında hata saydıysa sıfırla.
+    # =========================================================================
+    - name: "CLEANUP | GFS2/PostgreSQL resource hata sayaçlarını sıfırla"
+      command: "pcs resource cleanup {{ item }}"
+      loop:
+        - gfs2_lv_activate-clone
+        - gfs2_fs-clone
+        - pgsql_lv_activate
+        - pgsql_fs
+      failed_when: false
+      changed_when: false
+
+    - name: "VERIFY | Tüm kaynakların başlamasını bekle (45s)"
+      pause:
+        seconds: 45
+
+    - name: "WAIT | GFS2 LV activate'in her iki node'da başlamasını bekle"
+      command: pcs resource status gfs2_lv_activate-clone
+      register: gfs2_lv_wait
+      retries: 30
+      delay: 10
+      until: >
+        gfs2_lv_wait.stdout | regex_search('Started.*' + groups['cluster_nodes'][0].split('.')[0])
+        and gfs2_lv_wait.stdout | regex_search('Started.*' + groups['cluster_nodes'][1].split('.')[0])
+      changed_when: false
+      failed_when: >
+        not (gfs2_lv_wait.stdout | regex_search('Started.*' + groups['cluster_nodes'][0].split('.')[0]))
+        or not (gfs2_lv_wait.stdout | regex_search('Started.*' + groups['cluster_nodes'][1].split('.')[0]))
+
+    - name: "WAIT | GFS2 Filesystem'in her iki node'da başlamasını bekle"
+      command: pcs resource status gfs2_fs-clone
+      register: gfs2_fs_wait
+      retries: 20
+      delay: 10
+      until: >
+        gfs2_fs_wait.stdout | regex_search('Started.*' + groups['cluster_nodes'][0].split('.')[0])
+        and gfs2_fs_wait.stdout | regex_search('Started.*' + groups['cluster_nodes'][1].split('.')[0])
+      changed_when: false
+      failed_when: >
+        not (gfs2_fs_wait.stdout | regex_search('Started.*' + groups['cluster_nodes'][0].split('.')[0]))
+        or not (gfs2_fs_wait.stdout | regex_search('Started.*' + groups['cluster_nodes'][1].split('.')[0]))
+
+    - name: "RESULT | GFS2 kaynak durumu"
+      debug:
+        msg: |
+          gfs2_lv_activate-clone: {{ gfs2_lv_wait.stdout_lines }}
+          gfs2_fs-clone:          {{ gfs2_fs_wait.stdout_lines }}
+
+
+# =============================================================================
+# PLAY 12: POSTGRESQL KURULUMU VE YAPILANDIRMASI
+# =============================================================================
+- name: "PLAY 12/13 | PostgreSQL Kurulumu ve Yapılandırması"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+  any_errors_fatal: true
+
+  tasks:
+    # FIX: wait_for(path) yerine mountpoint komutu ile gerçek mount kontrolü
+    # Eski hata: wait_for path={{ pgsql_mount }} → dizin PLAY10'da oluşturulduğundan
+    # her zaman "mevcut" görünüyor, mount edilip edilmediğini test etmiyordu.
+    - name: "PGSQL | pgsql_fs'in mount olmasını bekleniyor"
+      command: "mountpoint -q {{ pgsql_mount }}"
+      register: pgsql_mount_wait
+      retries: 18
+      delay: 10
+      until: pgsql_mount_wait.rc == 0
+      changed_when: false
+      failed_when: false
+
+    - name: "ASSERT | pgsql_fs mount edilmiş olmalı"
+      assert:
+        that: pgsql_mount_wait.rc == 0
+        success_msg: "✓ {{ pgsql_mount }} mount edildi"
+        fail_msg: |
+          ✗ HATA: {{ pgsql_mount }} mount edilmedi!
+          ÇÖZÜM:
+            pcs resource status pgsql_lv_activate
+            pcs resource status pgsql_fs
+            pcs resource cleanup pgsql_lv_activate
+            pcs resource cleanup pgsql_fs
+
+    - name: "PGSQL | Mount noktası izinleri"
+      file:
+        path: "{{ pgsql_mount }}"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+
+    - name: "PGSQL | PostgreSQL data dizini kontrolü"
+      stat:
+        path: "{{ pgsql_data_dir }}/PG_VERSION"
+      register: pg_data_check
+
+    - name: "PGSQL | initdb - PostgreSQL başlatılıyor"
+      block:
+        - name: "initdb | Data dizini oluştur"
+          file:
+            path: "{{ pgsql_data_dir }}"
+            state: directory
+            owner: postgres
+            group: postgres
+            mode: '0700'
+          when: not pg_data_check.stat.exists
+
+        - name: "initdb | initdb çalıştır"
+          command: "/usr/pgsql-{{ pgsql_version }}/bin/initdb -D {{ pgsql_data_dir }} --encoding=UTF8 --locale=en_US.UTF-8"
+          become_user: postgres
+          when: not pg_data_check.stat.exists
+          register: initdb_result
+
+        # FIX: initdb_result tanımlı olup olmadığı kontrol ediliyor
+        # Eski hata: when: not pg_data_check.stat.exists false olunca initdb_result
+        # register edilmiyordu → "initdb_result is changed" → UndefinedError
+        - name: "initdb | Sonuç"
+          debug:
+            msg: "✓ PostgreSQL başlatıldı: {{ pgsql_data_dir }}"
+          when: initdb_result is defined and initdb_result is changed
+
+        - name: "initdb | Zaten mevcut"
+          debug:
+            msg: "✓ PostgreSQL data dizini zaten mevcut, atlanıyor"
+          when: pg_data_check.stat.exists
+      rescue:
+        - name: "ERROR | initdb hatası"
+          debug:
+            msg: |
+              ✗ HATA: PostgreSQL initdb başarısız!
+              ÇÖZÜM:
+                su - postgres -c "/usr/pgsql-{{ pgsql_version }}/bin/initdb -D {{ pgsql_data_dir }}"
+                ls -la {{ pgsql_data_dir }}
+                df -h {{ pgsql_mount }}
+              Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}
+          failed_when: true
+
+    - name: "PGSQL | postgresql.conf yapılandırılıyor"
+      block:
+        - name: "CONF | listen_addresses"
+          lineinfile:
+            path: "{{ pgsql_data_dir }}/postgresql.conf"
+            regexp: '^#?listen_addresses'
+            line: "listen_addresses = '*'"
+            backup: yes
+
+        - name: "CONF | port"
+          lineinfile:
+            path: "{{ pgsql_data_dir }}/postgresql.conf"
+            regexp: '^#?port\s*='
+            line: "port = {{ pgsql_port }}"
+
+        - name: "CONF | max_connections"
+          lineinfile:
+            path: "{{ pgsql_data_dir }}/postgresql.conf"
+            regexp: '^#?max_connections'
+            line: "max_connections = 200"
+
+        - name: "CONF | log_destination"
+          lineinfile:
+            path: "{{ pgsql_data_dir }}/postgresql.conf"
+            regexp: '^#?log_destination'
+            line: "log_destination = 'stderr'"
+
+        - name: "CONF | logging_collector"
+          lineinfile:
+            path: "{{ pgsql_data_dir }}/postgresql.conf"
+            regexp: '^#?logging_collector'
+            line: "logging_collector = on"
+
+        - name: "RESULT | postgresql.conf yapılandırıldı"
+          debug:
+            msg: "✓ postgresql.conf yapılandırıldı"
+
+    - name: "PGSQL | pg_hba.conf yapılandırılıyor"
+      blockinfile:
+        path: "{{ pgsql_data_dir }}/pg_hba.conf"
+        block: |
+          # ---- CLUSTER ACCESS (ANSIBLE MANAGED) ----
+          {% for net in pgsql_allowed_networks %}
+          host    all             all             {{ net }}          md5
+          {% endfor %}
+          # ---- LOCAL SOCKET ----
+          local   all             postgres                           peer
+          local   all             all                                md5
+        marker: "# {mark} ANSIBLE MANAGED HA CLUSTER ACCESS"
+        backup: yes
+
+    - name: "RESULT | pg_hba.conf yapılandırıldı"
+      debug:
+        msg: "✓ pg_hba.conf yapılandırıldı"
+
+    # FIX: PostgreSQL systemd servisi TÜM cluster node'larında maskeleniyor
+    # Eski hata: Sadece groups['cluster_nodes'][1]'e delegate ediliyordu,
+    # daha fazla node olursa atlanırdı. Döngü ile tüm node'lar kapsanıyor.
+    - name: "SERVICE | PostgreSQL systemd servisi maskeleniyor (tüm node'lar)"
+      systemd:
+        name: "postgresql-{{ pgsql_version }}"
+        state: stopped
+        enabled: no
+        masked: yes
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['cluster_nodes'] }}"
+      failed_when: false
+
+    - name: "RESULT | PostgreSQL maskeleme tamamlandı"
+      debug:
+        msg: "✓ postgresql-{{ pgsql_version }} tüm node'larda maskelendi (Cluster yönetiyor)"
+
+    # ---- PostgreSQL Cluster Kaynağı ----------------------------------------
+    # KÖK NEDEN: pcs resource create sonrası Pacemaker tüm node'larda probe yapar.
+    # clstr02'de pgsql_fs mount'lu değil → postgresql.conf yok → "not installed".
+    # on-fail=block devreye girer → BLOCKED.
+    #
+    # DOĞRU ÇÖZÜM: target-role=Stopped ile oluştur → tüm constraint'leri ekle →
+    # cleanup (stale probe temizle) → sonra Started yap → wait.
+    # Bu şekilde Pacemaker constraint'leri bilmeden probe yapmaz.
+    - name: "RESOURCE | PostgreSQL cluster kaynağı"
+      block:
+        - name: "CHECK | postgresql kaynağı mevcut mu"
+          command: pcs resource config postgresql
+          register: pgsql_res_check
+          changed_when: false
+          failed_when: false
+
+        # target-role=Stopped: kaynak oluşturulur ama henüz başlatılmaz.
+        # Pacemaker probe yapmaz, on-fail=block tetiklenmez.
+        #
+        # FENCING LOOP ÖNLEMİ:
+        #   stop on-fail=block: Stop fail ederse (örn. pgsql_fs mount'lu değilken
+        #   "not installed" dönerse) node fence EDİLMEZ. Pacemaker durur, operatör
+        #   "pcs resource cleanup postgresql" ile müdahale eder.
+        #   on-fail=fence burada sonsuz döngü yaratır:
+        #     stop fail → fence → reboot → pgsql_fs yok → stop fail → ...
+        #
+        #   failure-timeout=3600s: Hatalar 1 saat sonra sıfırlanır.
+        #   migration-threshold=3 ile birlikte: 3 hata → başka node'a taşı →
+        #   1 saat sonra hata sayacı sıfırla → tekrar deneyebilir.
+        - name: "CREATE | postgresql (Stopped — constraint'ler eklenene kadar)"
+          command: >
+            pcs resource create postgresql ocf:heartbeat:pgsql
+            pgctl="/usr/pgsql-{{ pgsql_version }}/bin/pg_ctl"
+            psql="/usr/pgsql-{{ pgsql_version }}/bin/psql"
+            pgdata="{{ pgsql_data_dir }}"
+            pgport={{ pgsql_port }}
+            rep_mode=none
+            op start timeout={{ resource_start_timeout }} on-fail=restart
+            op stop timeout={{ resource_stop_timeout }} on-fail=block
+            op monitor interval={{ resource_monitor_interval }} timeout=30s on-fail=restart
+            meta target-role=Stopped failure-timeout=3600s
+          when: pgsql_res_check.rc != 0
+
+        - name: "RESULT | postgresql kaynağı oluşturuldu (Stopped)"
+          debug:
+            msg: "✓ postgresql cluster kaynağı {{ 'oluşturuldu (Stopped)' if pgsql_res_check.rc != 0 else 'zaten mevcut' }}"
+
+        # Constraint'ler önce eklenir, resource sonra başlatılır.
+        #
+        # ORDER zinciri (başlangıç sırası):
+        #   lvmlockd → pgsql_lv_activate → pgsql_fs → postgresql
+        #
+        # COLOCATION zinciri (aynı node zorunluluğu):
+        #   postgresql ↔ pgsql_fs ↔ pgsql_lv_activate ↔ vip
+        #   (her resource bir öncekinin olduğu node'a bağlı)
+
+        - name: "ORDER | pgsql_fs → postgresql"
+          command: >
+            pcs constraint order start pgsql_fs
+            then postgresql
+            id=order-psqlfs-postgresql
+          register: pgsql_order
+          failed_when: pgsql_order.rc != 0 and 'already exists' not in (pgsql_order.stderr | default(''))
+          changed_when: pgsql_order.rc == 0
+
+        # postgresql neredeyse pgsql_fs orada (zincirin son halkası)
+        - name: "COLOCATION | postgresql ile pgsql_fs"
+          command: >
+            pcs constraint colocation add postgresql with pgsql_fs INFINITY
+            id=colo-postgresql-psqlfs
+          register: pgsql_colo
+          failed_when: pgsql_colo.rc != 0 and 'already exists' not in (pgsql_colo.stderr | default(''))
+          changed_when: pgsql_colo.rc == 0
+
+        - name: "VERIFY | Tam constraint listesi"
+          command: pcs constraint
+          register: constraint_check
+          changed_when: false
+          failed_when: false
+
+        - name: "RESULT | Constraint listesi"
+          debug:
+            msg: "{{ constraint_check.stdout_lines }}"
+
+        # Stale probe kayıtlarını temizle (önceki başarısız denemelerden kalabilir)
+        - name: "CLEANUP | postgresql stale probe/hata kayıtları sıfırla"
+          command: pcs resource cleanup postgresql
+          failed_when: false
+          changed_when: false
+
+        # Artık constraint'ler tam — kaynağı başlat
+        - name: "START | postgresql target-role=Started yap"
+          command: pcs resource meta postgresql target-role=Started
+          when: pgsql_res_check.rc != 0
+          failed_when: false
+
+        - name: "WAIT | postgresql'in vip ile aynı node'da başlamasını bekle"
+          command: pcs resource status postgresql
+          register: pgsql_wait
+          retries: 24
+          delay: 10
+          until: "'Started' in pgsql_wait.stdout"
+          changed_when: false
+          failed_when: >
+            pgsql_wait.attempts | default(0) >= 24
+            and 'Started' not in pgsql_wait.stdout
+
+        - name: "RESULT | PostgreSQL kaynak durumu"
+          debug:
+            msg: "{{ pgsql_wait.stdout_lines }}"
+
+        - name: "RESULT | PostgreSQL kurallar ve başlatma tamamlandı"
+          debug:
+            msg: "✓ PostgreSQL constraint'ler eklendi, kaynak başlatıldı"
+      rescue:
+        - name: "ERROR | PostgreSQL kaynak hatası"
+          debug:
+            msg: |
+              ✗ HATA: PostgreSQL cluster kaynağı oluşturulamadı!
+              KONTROL:
+                pcs resource status postgresql
+                pcs resource cleanup postgresql
+                pcs resource status pgsql_lv_activate
+                pcs resource status pgsql_fs
+                df -h {{ pgsql_mount }}
+                ls -la {{ pgsql_data_dir }}
+              Hata: {{ ansible_failed_result.msg | default('bilinmiyor') }}
+          failed_when: true
+
+
+# =============================================================================
+# PLAY 13b: POSTGRESQL KULLANICI PAROLASI
+# =============================================================================
+# Bu play cluster kurulumu tamamlandıktan sonra çalışır.
+# Node'lardan bağımsız olarak Virtual IP (VIP) üzerinden PostgreSQL'e bağlanır.
+# Parola hosts.yml → pgsql_password değişkeninden okunur.
+#
+# Neden VIP üzerinden?
+#   - VIP her zaman aktif node'u gösterir; node ismi veya IP'si bilinmeden çalışır.
+#   - Node failover olsa bile parola zaten ayarlandığından tekrar çalışmaz (idempotent).
+#   - Kurulumu yapan makine cluster node olmak zorunda değildir.
+# =============================================================================
+- name: "PLAY 13b/13 | PostgreSQL Kullanıcı Parolası (VIP üzerinden)"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+  any_errors_fatal: false
+
+  # Neden cluster_nodes[0]?
+  #   - psql binary cluster node'larında kurulu, bastion'da olmayabilir.
+  #   - VIP aktif node'u gösterir; psql -h VIP ile node'dan bağımsız erişilir.
+  #   - pg_hba.conf → 127.0.0.1 peer yerine -h VIP ile md5 auth kullanılır.
+  #   - İdempotent: parola zaten ayarlıysa "ALTER ROLE" başarıyla döner.
+
+  tasks:
+    - name: "PGSQL PAROLA | VIP üzerinden PostgreSQL portu erişilebilir mi"
+      wait_for:
+        host: "{{ virtual_ip }}"
+        port: "{{ pgsql_port }}"
+        timeout: 120
+        delay: 5
+      delegate_to: localhost
+
+    - name: "PGSQL PAROLA | psql binary mevcut mu"
+      command: "which psql"
+      register: psql_which
+      changed_when: false
+      failed_when: false
+
+    - name: "PGSQL PAROLA | psql PATH'i"
+      set_fact:
+        psql_bin: "{{ psql_which.stdout | trim if psql_which.rc == 0 else '/usr/pgsql-' + pgsql_version + '/bin/psql' }}"
+
+    - name: "INFO | Kullanılacak psql binary"
+      debug:
+        msg: "psql binary: {{ psql_bin }}"
+
+    # İlk bağlantı local UNIX socket + peer auth ile yapılır (parola henüz yok).
+    # become_user: postgres → peer auth geçer, PGPASSWORD gerekmez.
+    # -h belirtilmez → UNIX socket kullanılır → pg_hba.conf: local all postgres peer
+    # Parola set edildikten sonra VIP üzerinden md5 ile bağlanılabilir.
+    - name: "PGSQL PAROLA | postgres parolası local socket üzerinden ayarlanıyor"
+      shell: |
+        {{ psql_bin }} \
+          -p {{ pgsql_port }} \
+          -U postgres \
+          -c "ALTER ROLE postgres WITH PASSWORD '{{ pgsql_password }}';"
+      become: yes
+      become_user: postgres
+      register: alter_role_result
+      changed_when: "'ALTER ROLE' in alter_role_result.stdout"
+      failed_when: alter_role_result.rc != 0
+      no_log: false
+
+    - name: "RESULT | psql stdout/stderr"
+      debug:
+        msg: |
+          rc     : {{ alter_role_result.rc }}
+          stdout : {{ alter_role_result.stdout }}
+          stderr : {{ alter_role_result.stderr }}
+
+    - name: "RESULT | postgres parolası ayarlandı"
+      debug:
+        msg: |
+          ✓ postgres kullanıcısı parolası ayarlandı (local peer auth)
+            Artık VIP üzerinden bağlanılabilir:
+            psql -h {{ virtual_ip }} -p {{ pgsql_port }} -U postgres
+      when: alter_role_result.rc == 0
+
+
+# =============================================================================
+# PLAY 13: SON DOĞRULAMA VE TEST
+# =============================================================================
+- name: "PLAY 13/13 | Son Doğrulama ve Testler"
+  hosts: "{{ groups['cluster_nodes'][0] }}"
+  gather_facts: no
+  become: yes
+
+  tasks:
+    - name: "VERIFY | Kurulum sonrası tüm resource hata sayaçlarını sıfırla"
+      command: pcs resource cleanup
+      failed_when: false
+      changed_when: false
+
+    - name: "VERIFY | Tüm kaynakların başlamasını bekleniyor"
+      pause:
+        seconds: 45
+
+    - name: "VERIFY | Cluster genel durumu"
+      command: pcs status
+      register: final_cluster_status
+      changed_when: false
+      failed_when: false
+
+    - name: "RESULT | Cluster Durumu"
+      debug:
+        msg: "{{ final_cluster_status.stdout_lines }}"
+
+    - name: "VERIFY | Kaynak durumu"
+      command: pcs resource status
+      register: resource_check
+      changed_when: false
+      failed_when: false
+
+    - name: "VERIFY | Tam cluster durumu"
+      command: pcs status --full
+      register: full_status
+      changed_when: false
+      failed_when: false
+
+    # FIX: pcs stonith status - RHEL9 pcs versiyonu uyumlu fallback
+    # Eski durum: "pcs stonith status" bazı versiyonlarda "pcs stonith" olarak değişti
+    - name: "TEST | STONITH durumu (pcs stonith)"
+      command: pcs stonith
+      register: stonith_status
+      changed_when: false
+      failed_when: false
+
+    - name: "TEST | STONITH durumu (fallback: pcs resource status fence)"
+      command: "pcs resource status"
+      register: stonith_fallback
+      changed_when: false
+      failed_when: false
+      when: stonith_status.rc != 0
+
+    - name: "RESULT | STONITH durumu"
+      debug:
+        msg: |
+          {% if stonith_status.rc == 0 %}
+          {{ stonith_status.stdout_lines }}
+          {% else %}
+          ℹ Stonith durumu (pcs resource status'dan):
+          {{ stonith_fallback.stdout_lines if stonith_fallback is defined else ['Alınamadı'] }}
+          {% endif %}
+
+    - name: "TEST | Constraint'ler"
+      command: pcs constraint show --full
+      register: constraint_check
+      changed_when: false
+      failed_when: false
+
+    - name: "RESULT | Constraint'ler"
+      debug:
+        msg: "{{ constraint_check.stdout_lines }}"
+
+    - name: "TEST | GFS2 mount durumu"
+      command: "mountpoint -q {{ gfs2_mount }}"
+      register: gfs2_mount_check
+      changed_when: false
+      failed_when: false
+
+    - name: "RESULT | GFS2 mount"
+      debug:
+        msg: "{{ '✓ GFS2 mount edildi: ' + gfs2_mount if gfs2_mount_check.rc == 0 else '⚠ GFS2 henüz mount edilmedi (kaynak başlatılıyor olabilir)' }}"
+
+    - name: "TEST | PostgreSQL disk mount durumu"
+      command: "mountpoint -q {{ pgsql_mount }}"
+      register: pgsql_mount_check
+      changed_when: false
+      failed_when: false
+
+    - name: "RESULT | PostgreSQL mount"
+      debug:
+        msg: "{{ '✓ PostgreSQL disk mount edildi: ' + pgsql_mount if pgsql_mount_check.rc == 0 else 'ℹ PostgreSQL disk bu node aktif değilse mount edilmemesi NORMALDIR' }}"
+
+    - name: "TEST | Virtual IP aktif mi"
+      command: "ip addr show"
+      register: vip_check_raw
+      changed_when: false
+      failed_when: false
+
+    - name: "RESULT | VIP durumu"
+      debug:
+        msg: "{{ '✓ VIP bu node aktif: ' + virtual_ip if virtual_ip in vip_check_raw.stdout else 'ℹ VIP diğer node üzerinde aktif olabilir (normal)' }}"
+
+    - name: "TEST | Quorum durumu"
+      command: corosync-quorumtool -s
+      register: quorum_check
+      changed_when: false
+      failed_when: false
+
+    - name: "RESULT | Quorum"
+      debug:
+        msg: "{{ quorum_check.stdout_lines }}"
+
+    - name: "VERIFY | Başarısız kaynak sayısı"
+      command: pcs resource failcount show
+      register: failcount
+      changed_when: false
+      failed_when: false
+
+    - name: "INFO | Failcount"
+      debug:
+        msg: "{{ failcount.stdout_lines | default(['(boş)']) }}"
+
+    - name: "VERIFY | Başarısız kaynak var mı?"
+      command: pcs status xml
+      register: pcs_xml_status
+      changed_when: false
+      failed_when: false
+
+    - name: "WARN | Başarısız kaynak uyarısı"
+      debug:
+        msg: |
+          ⚠ UYARI: Başarısız kaynaklar olabilir!
+          KONTROL:
+            pcs status
+            pcs resource cleanup
+            journalctl -u pacemaker -n 100
+      when: "'failed' in (pcs_xml_status.stdout | lower) and 'failed=\"0\"' not in pcs_xml_status.stdout"
+
+    - name: "CLEANUP | Kurulum VIP tercih kısıtlaması kaldırılıyor"
+      command: >
+        pcs constraint remove loc-vip-prefer-node0
+      register: vip_loc_remove
+      failed_when: false
+      changed_when: vip_loc_remove.rc == 0
+
+    - name: "INFO | VIP kısıtlama kaldırma sonucu"
+      debug:
+        msg: "{{ '✓ Kurulum VIP tercihi kaldırıldı — VIP artık serbestçe failover yapabilir' if vip_loc_remove.rc == 0 else 'ℹ VIP kurulum tercihi zaten yoktu' }}"
+
+    - name: "FINAL | Kurulum tamamlama raporu"
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════════╗
+          ║         RED HAT 9 HA CLUSTER KURULUMU TAMAMLANDI                    ║
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  Cluster Adı   : {{ cluster_name }}
+          ║  Node'lar      :
+          {% for host in groups['cluster_nodes'] %}
+          ║    {{ loop.index }}. {{ host }} ({{ hostvars[host].ansible_host }} / {{ hostvars[host].cluster_ip }})
+          {% endfor %}
+          ║  Quorum        : {{ groups['quorum_device'][0] }} ({{ hostvars[groups['quorum_device'][0]].ansible_host }})
+          ║  Virtual IP    : {{ virtual_ip }}/{{ virtual_ip_cidr }}
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  DEPOLAMA:
+          ║    GFS2  Disk  : {{ shared_disk }} → VG: {{ shared_vg }}
+          ║    PgSQL Disk  : {{ db_disk }} → VG: {{ db_vg }}
+          ║    GFS2 LV     : /dev/{{ shared_vg }}/{{ gfs2_lv }} ({{ gfs2_lv_size }})
+          ║                  Mount: {{ gfs2_mount }} (Aktif/Aktif - Her 2 Node)
+          ║    pgsql LV    : /dev/{{ db_vg }}/{{ pgsql_lv }} ({{ pgsql_lv_size }})
+          ║                  Mount: {{ pgsql_mount }} (Aktif/Pasif - Sadece 1 Node)
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  KAYNAKLAR:
+          ║    fence_ipmi_<node>  - STONITH (IPMI/iDRAC/iLO)
+          ║    dlm-clone          - DLM (Her 2 Node)
+          ║    lvmlockd-clone     - LVM Locking (Her 2 Node)
+          ║    gfs2_lv_activate-clone - GFS2 LV (Her 2 Node)
+          ║    gfs2_fs-clone      - GFS2 Filesystem (Her 2 Node)
+          ║    pgsql_lv_activate  - pgsql LV (Sadece Aktif Node)
+          ║    pgsql_fs           - pgsql Filesystem (Sadece Aktif Node)
+          ║    vip                - Virtual IP (Sadece Aktif Node)
+          ║    postgresql         - PostgreSQL (Sadece Aktif Node)
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  KAYNAK SIRALAMA (Doğru sıra):
+          ║    dlm-clone → lvmlockd-clone → gfs2_lv_activate-clone → gfs2_fs-clone
+          ║    lvmlockd-clone → pgsql_lv_activate → pgsql_fs → postgresql
+          ║    Colocation: postgresql + pgsql_fs + pgsql_lv_activate ↔ vip
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  KONTROL KOMUTLARI:
+          ║    pcs status              - Cluster durumu
+          ║    pcs resource status     - Kaynak durumu
+          ║    pcs stonith             - STONITH durumu
+          ║    pcs constraint show     - Constraint'ler
+          ║    pcs quorum status       - Quorum durumu
+          ║    corosync-quorumtool -s  - Quorum ayrıntı
+          ║    crm_verify -L -V        - Yapılandırma doğrulama
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  SORUN AYIKLAMA:
+          ║    journalctl -u pacemaker -f   - Pacemaker logları
+          ║    journalctl -u corosync  -f   - Corosync logları
+          ║    pcs resource cleanup         - Hata sayaçlarını sıfırla
+          ║    pcs resource debug-start <r> - Kaynağı debug başlat
+          ╚══════════════════════════════════════════════════════════════════════╝

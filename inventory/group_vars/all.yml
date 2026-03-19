@@ -1,0 +1,247 @@
+---
+# =============================================================================
+# HESAPLANMIŞ DEĞİŞKENLER - Bu dosyayı düzenlemeyin!
+# hosts.yml'deki değerlerden otomatik türetilir.
+# =============================================================================
+
+# ---- PAKET LİSTELERİ -------------------------------------------------------
+
+ha_packages:
+  - resource-agents
+  - resource-agents-paf
+  - pacemaker 
+  - pcs 
+  - fence-agents-all   
+  - corosync  
+  - corosync-qdevice
+  - corosync-vqsim
+  - corosync-qnetd
+  - dlm  
+  - lvm2-lockd  
+  - gfs2-utils  
+  - ipmitool  
+  - iscsi-initiator-utils  
+  - lvm2  
+  - "postgresql{{ pgsql_version }}-server"
+  - "postgresql{{ pgsql_version }}"
+  - "postgresql{{ pgsql_version }}-contrib"
+  
+
+qdevice_packages:
+  - corosync-qnetd
+  - corosync-qdevice
+  - pcs                 # pcsd servisi bu paketle gelir (zorunlu)
+
+# ---- CLUSTER NODE KONFİGÜRASYONU (Dinamik) ---------------------------------
+
+cluster_nodes_config: >-
+  {%- set ns = namespace(nodes=[]) -%}
+  {%- for host in groups['cluster_nodes'] -%}
+    {%- set node = {
+      'node_name': host,
+      'corosync_addresses': [hostvars[host].cluster_ip]
+    } -%}
+    {%- set _ = ns.nodes.append(node) -%}
+  {%- endfor -%}
+  {{ ns.nodes }}
+
+# ---- STONITH KAYNAKLARI (fence_ipmilan - IPMI/iDRAC/iLO) ----------------
+# Her cluster node için ayrı IPMI fence kaynağı oluşturulur
+# Kaynak adı: fence_ipmi_<hostname>
+# Her node kendi IPMI bilgileriyle tanımlanır (inventory/hosts.yml'den okunur)
+
+fence_resources: >-
+  {%- set ns = namespace(fences=[]) -%}
+  {%- for host in groups['cluster_nodes'] -%}
+    {%- set fence = {
+      'id': 'fence_ipmi_' + host,
+      'agent': 'stonith:fence_ipmilan',
+      'instance_attrs': [{
+        'attrs': [
+          {'name': 'pcmk_host_check', 'value': 'static-list'},
+          {'name': 'pcmk_host_list', 'value': host},
+          {'name': 'ipaddr',          'value': hostvars[host].ipmi_ip},
+          {'name': 'ipport',          'value': hostvars[host].ipmi_port | string},
+          {'name': 'login',           'value': hostvars[host].ipmi_user},
+          {'name': 'passwd',          'value': hostvars[host].ipmi_password},
+          {'name': 'lanplus',         'value': hostvars[host].ipmi_lanplus | string},
+          {'name': 'action',          'value': stonith_action},
+          {'name': 'delay',           'value': '5'},
+          {'name': 'power_timeout',   'value': '20'},
+          {'name': 'power_wait',      'value': '3'},
+          {'name': 'status_retries',  'value': '6'},
+          {'name': 'plug',            'value': host}
+        ]
+      }],
+      'meta_attrs': [{
+        'attrs': [
+          {'name': 'target-role', 'value': 'Started'}
+        ]
+      }],
+      'operations': [{
+        'action': 'monitor',
+        'attrs': [
+          {'name': 'interval', 'value': '60s'},
+          {'name': 'timeout',  'value': '60s'}
+        ]
+      }]
+    } -%}
+    {%- set _ = ns.fences.append(fence) -%}
+  {%- endfor -%}
+  {{ ns.fences }}
+
+# ---- TEMEL CLUSTER KAYNAKLARI (ha_cluster rolü için) ----------------------
+
+base_cluster_resources:
+  # DLM - Distributed Lock Manager (GFS2 için zorunlu)
+  - id: dlm
+    agent: "ocf:pacemaker:controld"
+    instance_attrs:
+      - attrs:
+          - name: args
+            value: ""
+    operations:
+      - action: monitor
+        attrs:
+          - name: interval
+            value: "30s"
+          - name: timeout
+            value: "30s"
+      - action: start
+        attrs:
+          - name: timeout
+            value: "90s"
+      - action: stop
+        attrs:
+          - name: timeout
+            value: "100s"
+
+  # lvmlockd - LVM locking daemon (Paylaşımlı LVM için zorunlu)
+  - id: lvmlockd
+    agent: "ocf:heartbeat:lvmlockd"
+    instance_attrs:
+      - attrs:
+          - name: args
+            value: ""
+    operations:
+      - action: monitor
+        attrs:
+          - name: interval
+            value: "30s"
+          - name: timeout
+            value: "30s"
+      - action: start
+        attrs:
+          - name: timeout
+            value: "90s"
+      - action: stop
+        attrs:
+          - name: timeout
+            value: "100s"
+
+  # VIP - Virtual IP (Aktif node'a taşınan sanal IP)
+  - id: vip
+    agent: "ocf:heartbeat:IPaddr2"
+    instance_attrs:
+      - attrs:
+          - name: ip
+            value: "{{ virtual_ip }}"
+          - name: cidr_netmask
+            value: "{{ virtual_ip_cidr }}"
+          - name: nic
+            value: "{{ public_nic }}"
+    operations:
+      - action: monitor
+        attrs:
+          - name: interval
+            value: "30s"
+          - name: timeout
+            value: "20s"
+      - action: start
+        attrs:
+          - name: timeout
+            value: "60s"
+      - action: stop
+        attrs:
+          - name: timeout
+            value: "60s"
+
+# ---- RESOURCE CLONE'LARI (DLM ve lvmlockd her node'da çalışır) -----------
+
+base_resource_clones:
+  - resource_id: dlm
+    id: dlm-clone
+    meta_attrs:
+      - attrs:
+          - name: interleave
+            value: "true"
+          - name: ordered
+            value: "true"
+
+  - resource_id: lvmlockd
+    id: lvmlockd-clone
+    meta_attrs:
+      - attrs:
+          - name: interleave
+            value: "true"
+          - name: ordered
+            value: "true"
+
+# ---- CLUSTER CONSTRAINTS (ha_cluster rolü için temel sıralama) -----------
+
+base_constraints_order:
+  # dlm başlamadan lvmlockd başlamasın
+  - id: order-dlm-lvmlockd
+    resource_first:
+      id: dlm-clone
+    resource_then:
+      id: lvmlockd-clone
+
+base_constraints_colocation: []
+
+# ---- CLUSTER ÖZELLİKLERİ -------------------------------------------------
+
+cluster_properties:
+  - attrs:
+      - name: stonith-enabled
+        value: "true"
+      - name: stonith-action
+        value: "{{ stonith_action }}"
+      - name: no-quorum-policy
+        value: "{{ no_quorum_policy }}"
+
+resource_defaults:
+  - id: res-defaults
+    attrs:
+      - name: resource-stickiness
+        value: "{{ resource_stickiness }}"
+      - name: migration-threshold
+        value: "{{ migration_threshold }}"
+
+# ---- FENCE LOCATION CONSTRAINTS (Bir node kendini fence edemez) ----------
+
+fence_location_constraints: >-
+  {%- set ns = namespace(constraints=[]) -%}
+  {%- for host in groups['cluster_nodes'] -%}
+    {%- set constraint = {
+      'id': 'loc-fence-' + host,
+      'resource': {'id': 'fence_ipmi_' + host},
+      'node': host,
+      'score': '-INFINITY'
+    } -%}
+    {%- set _ = ns.constraints.append(constraint) -%}
+  {%- endfor -%}
+  {{ ns.constraints }}
+
+# ---- /etc/hosts HESAPLAMA -------------------------------------------------
+
+all_hosts_entries: >-
+  {%- set lines = [] -%}
+  {%- for host in groups['cluster_nodes'] -%}
+  {%- set _ = lines.append(hostvars[host].ansible_host + ' ' + host + ' ' + host + '.' + cluster_domain) -%}
+  {%- set _ = lines.append(hostvars[host].cluster_ip + ' ' + host + '-cluster') -%}
+  {%- endfor -%}
+  {%- for host in groups['quorum_device'] -%}
+  {%- set _ = lines.append(hostvars[host].ansible_host + ' ' + host + ' ' + host + '.' + cluster_domain) -%}
+  {%- endfor -%}
+  {{ lines | join('\n') }}
